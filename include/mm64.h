@@ -72,5 +72,7 @@
 int print_pgtbl_entries(struct pcb_t *caller);
 addr_t mm64_pgtbl_stats(struct mm_struct *mm, int ntbl[5]);
 void mm64_free_pgtbl(struct mm_struct *mm);
+int mm64_for_each_pte(struct mm_struct *mm,
+                      int (*fn)(addr_t pgn, addr_t pte, void *arg), void *arg);
 
 #endif

@@ -1,5 +1,5 @@
-#ifndef QUEUE_H
-#define QUEUE_H
+#ifndef SCHED_H
+#define SCHED_H
 
 #include "common.h"
 
@@ -26,6 +26,12 @@ void put_proc(struct pcb_t * proc);
 
 /* Add a new process to ready queue */
 void add_proc(struct pcb_t * proc);
+
+/* Find a live process by PID (kernel side, used by system calls) */
+struct pcb_t * find_proc_by_pid(uint32_t pid);
+
+/* Remove a finished process from the kernel lists before freeing it */
+void finish_proc(struct pcb_t * proc);
 
 #ifdef __cplusplus
 }

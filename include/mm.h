@@ -98,9 +98,11 @@ extern "C" {
 #define PAGING_PTE_SWPTYP(pte)  GETVAL(pte, PAGING_PTE_SWPTYP_MASK, PAGING_PTE_SWPTYP_LOBIT)
 
 /* Memory range operator */
-/* TODO implement the INCLUDE and OVERLAP checking mechanism */
-#define INCLUDE(x1,x2,y1,y2) (0)
-#define OVERLAP(x1,x2,y1,y2) (0)
+/* Ranges are half-open [x1,x2) and [y1,y2) */
+/* [x1,x2) lies inside [y1,y2) */
+#define INCLUDE(x1,x2,y1,y2) (((x1) >= (y1)) && ((x2) <= (y2)))
+/* [x1,x2) and [y1,y2) share at least one address */
+#define OVERLAP(x1,x2,y1,y2) (((x1) < (y2)) && ((y1) < (x2)))
 
 /* VM region prototypes */
 struct vm_rg_struct * init_vm_rg(addr_t rg_start, addr_t rg_end);
@@ -163,6 +165,10 @@ int validate_overlap_vm_area(struct pcb_t *caller, int vmaid, addr_t vmastart, a
 int get_free_vmrg_area(struct pcb_t *caller, int vmaid, int size, struct vm_rg_struct *newrg);
 int inc_vma_limit(struct pcb_t *caller, int vmaid, addr_t inc_sz);
 int find_victim_page(struct mm_struct* mm, addr_t *pgn);
+int vm_evict_page(struct pcb_t *caller, addr_t *retfpn);
+void mm_page_resident(struct mm_struct *mm, addr_t pgn);
+int free_pcb_memph(struct pcb_t *caller);
+int __mm_swap_page(struct pcb_t *caller, addr_t vicfpn, addr_t swpfpn);
 struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid);
 
 /* MEM/PHY protypes */

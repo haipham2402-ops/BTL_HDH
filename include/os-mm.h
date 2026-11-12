@@ -95,6 +95,18 @@ struct kcache_pool_struct {
 };
 
 
+/*
+ * Memory statistics of one process (report data)
+ */
+struct mm_stat_struct {
+   unsigned long alloc_ok, alloc_fail, free_ok;
+   unsigned long mem_read, mem_write;   /* byte accesses through the MMU */
+   unsigned long page_hit, page_fault;  /* page present / swapped in      */
+   unsigned long swap_in, swap_out;     /* pages moved MEMSWP->RAM, RAM->MEMSWP */
+   unsigned long evicted;               /* own pages chosen as victim     */
+   unsigned long invalid_access;
+};
+
 /* 
  * Memory management struct
  */
@@ -120,6 +132,8 @@ struct mm_struct {
    /* kmem cache pool */
    struct kcache_pool_struct *kcpooltbl;
 
+   /* statistics for the report */
+   struct mm_stat_struct stat;
 };
 
 

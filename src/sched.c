@@ -111,6 +111,39 @@ void put_mlq_proc(struct pcb_t * proc) {
 	pthread_mutex_unlock(&queue_lock);
 }
 
+/* Search a queue for a PID (caller holds queue_lock) */
+static struct pcb_t *
+find_in_queue(struct queue_t *q, uint32_t pid)
+{
+	int i;
+
+	for (i = 0; i < q->size; i++)
+		if (q->proc[i] != NULL && q->proc[i]->pid == pid)
+			return q->proc[i];
+	return NULL;
+}
+
+/* A finished process leaves running_list before its PCB is freed,
+ * otherwise the list keeps a dangling pointer */
+void finish_proc(struct pcb_t * proc) {
+	pthread_mutex_lock(&queue_lock);
+	purgequeue(&running_list, proc);
+	pthread_mutex_unlock(&queue_lock);
+}
+
+struct pcb_t * find_proc_by_pid(uint32_t pid) {
+	struct pcb_t *proc;
+	int prio;
+
+	pthread_mutex_lock(&queue_lock);
+	/* A process issuing a system call is running on a CPU */
+	proc = find_in_queue(&running_list, pid);
+	for (prio = 0; proc == NULL && prio < MAX_PRIO; prio++)
+		proc = find_in_queue(&mlq_ready_queue[prio], pid);
+	pthread_mutex_unlock(&queue_lock);
+	return proc;
+}
+
 void add_mlq_proc(struct pcb_t * proc) {
 	/* A newly loaded process goes to the ready queue of its
 	 * priority level; it joins running_list when dispatched.
@@ -164,6 +197,31 @@ void put_proc(struct pcb_t * proc) {
 	purgequeue(&running_list, proc);
 	enqueue(&run_queue, proc);
 	pthread_mutex_unlock(&queue_lock);
+}
+
+void finish_proc(struct pcb_t * proc) {
+	pthread_mutex_lock(&queue_lock);
+	purgequeue(&running_list, proc);
+	pthread_mutex_unlock(&queue_lock);
+}
+
+struct pcb_t * find_proc_by_pid(uint32_t pid) {
+	struct pcb_t *proc;
+	int i;
+
+	pthread_mutex_lock(&queue_lock);
+	proc = NULL;
+	for (i = 0; proc == NULL && i < running_list.size; i++)
+		if (running_list.proc[i]->pid == pid)
+			proc = running_list.proc[i];
+	for (i = 0; proc == NULL && i < ready_queue.size; i++)
+		if (ready_queue.proc[i]->pid == pid)
+			proc = ready_queue.proc[i];
+	for (i = 0; proc == NULL && i < run_queue.size; i++)
+		if (run_queue.proc[i]->pid == pid)
+			proc = run_queue.proc[i];
+	pthread_mutex_unlock(&queue_lock);
+	return proc;
 }
 
 void add_proc(struct pcb_t * proc) {
