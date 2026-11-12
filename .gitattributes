@@ -1,0 +1,5 @@
+# Keep LF so Makefile and shell scripts work in the Ubuntu VM even when edited on Windows
+* text=auto eol=lf
+*.pdf binary
+*.png binary
+*.zip binary

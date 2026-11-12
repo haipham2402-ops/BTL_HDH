@@ -1,0 +1,31 @@
+# Build artifacts
+obj/
+*.o
+*.a
+*.so
+os
+mem
+sched
+pdg
+dma_testbench
+
+# Verilator / simulation traces
+*.vcd
+*.fst
+obj_dir/
+
+# Test run scratch (keep curated results in my_output/*.output)
+my_output/*.log
+my_output/*.diff
+
+# Submission archive (built at the end, not versioned)
+assignment_*.zip
+*.zip
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
