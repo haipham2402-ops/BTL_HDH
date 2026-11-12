@@ -52,11 +52,18 @@ struct pgn_t{
 /*
  *  Memory region struct
  */
+/* Privilege mode bit of a region (as in the assignment description) */
+#define RG_MODE_KERNEL 0
+#define RG_MODE_USER   1
+
 struct vm_rg_struct {
    int vmaid;
 
    addr_t rg_start;
    addr_t rg_end;
+
+   /* Priviledge mode bit: usermode - 1, kernelmode - 0 */
+   int mode_bit;
 
    struct vm_rg_struct *rg_next;
 };
@@ -105,6 +112,9 @@ struct mm_stat_struct {
    unsigned long swap_in, swap_out;     /* pages moved MEMSWP->RAM, RAM->MEMSWP */
    unsigned long evicted;               /* own pages chosen as victim     */
    unsigned long invalid_access;
+   unsigned long kmalloc_ok, kfree_ok;  /* kernel buffers of the process  */
+   unsigned long kcopy_bytes;           /* copy_from_user + copy_to_user  */
+   unsigned long priv_violation;        /* user access to a kernel region */
 };
 
 /* 

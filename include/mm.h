@@ -117,6 +117,7 @@ addr_t alloc_pages_range(struct pcb_t *caller, int incpgnum, struct framephy_str
 int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
                 struct memphy_struct *mpdst, addr_t dstfpn) ;
 /* KMEM prototypes */
+int __kfree(struct pcb_t *caller, int rgid);
 addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *alloc_addr);
 addr_t __kmem_cache_alloc(struct pcb_t *caller, int vmaid, int rgid, int cache_pool_id, addr_t *alloc_addr);
 

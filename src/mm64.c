@@ -511,6 +511,7 @@ struct vm_rg_struct *init_vm_rg(addr_t rg_start, addr_t rg_end)
 
   rgnode->rg_start = rg_start;
   rgnode->rg_end = rg_end;
+  rgnode->mode_bit = RG_MODE_USER;
   rgnode->rg_next = NULL;
 
   return rgnode;

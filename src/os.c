@@ -152,9 +152,26 @@ static void * ld_routine(void * args) {
 	struct timer_id_t * timer_id = (struct timer_id_t*)args;
 #endif
 	int i = 0;
-  /* TODO init kernel page table directory */
+	printf("ld_routine\n");
+	os.mram = mram;
+	os.mswp = mswp;
+	os.active_mswp = active_mswp;
+
+	/* Kernel space: one mm shared by every process (all PCBs point to
+	 * the same krnl). Its area starts at PAGING64_KRNL_BASE, the upper
+	 * half of the address space, and is never swapped out.
+	 */
+	os.mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
+	init_mm(os.mm, NULL);
 #ifdef MM64
-	os.krnl_pgd = (addr_t*)malloc(PAGING64_MAX_PGN * sizeof(addr_t));
+	os.mm->mmap->vm_start = PAGING64_KRNL_BASE;
+	os.mm->mmap->vm_end = PAGING64_KRNL_BASE;
+	os.mm->mmap->sbrk = PAGING64_KRNL_BASE;
+	os.mm->mmap->vm_freerg_list->rg_start = PAGING64_KRNL_BASE;
+	os.mm->mmap->vm_freerg_list->rg_end = PAGING64_KRNL_BASE;
+
+	/* Kernel page table directory = root of the kernel mm tree */
+	os.krnl_pgd = os.mm->pgd;
 	os.krnl_p4d = NULL;
 	os.krnl_pud = NULL;
 	os.krnl_pmd = NULL;
@@ -162,13 +179,6 @@ static void * ld_routine(void * args) {
 #else
 	os.krnl_pgd = (uint32_t*)malloc(PAGING_MAX_PGN * sizeof(uint32_t));
 #endif
-	i=0;
-	printf("ld_routine\n");
-	os.mram = mram;
-	os.mswp = mswp;
-	os.active_mswp = active_mswp;
-	os.mm = (struct mm_struct*)malloc(sizeof(struct mm_struct));
-	init_mm(os.mm, NULL);
 	while (i < num_processes) {
 		struct pcb_t * proc = load(ld_processes.path[i]);
 		proc->krnl = &os;

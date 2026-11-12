@@ -39,6 +39,10 @@
 #define PAGING64_ADDR_PGD_HIBIT 56
 #define PAGING64_ADDR_PGD_LOBIT 48
 
+/* Kernel space: upper half of the 57-bit space, shared by all processes
+ * (user space is [0, PAGING64_KRNL_BASE)) */
+#define PAGING64_KRNL_BASE (1ULL << 56)
+
 /* Entries per directory at every level (9 index bits) */
 #define PAGING64_PTRS_PER_TBL 512
 
