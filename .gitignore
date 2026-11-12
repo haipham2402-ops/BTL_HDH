@@ -15,9 +15,6 @@ src/syscalltbl.lst
 *.fst
 obj_dir/
 
-# Test run scratch (keep curated results in my_output/*.output)
-my_output/*.log
-my_output/*.diff
 
 # Submission archive (built at the end, not versioned)
 assignment_*.zip
@@ -31,5 +28,8 @@ assignment_*.zip
 .DS_Store
 Thumbs.db
 
-# Test outputs and evidence per task: sent separately, never committed
-evidence/
+# Team-internal docs, notes, test scripts, outputs and evidence:
+# kept locally in team_local/ and shared separately, never committed
+team_local/
+*.md
+!/README.md
