@@ -8,6 +8,7 @@ mem
 sched
 pdg
 dma_testbench
+src/syscalltbl.lst
 
 # Verilator / simulation traces
 *.vcd
@@ -29,3 +30,6 @@ assignment_*.zip
 *~
 .DS_Store
 Thumbs.db
+
+# Test outputs and evidence per task: sent separately, never committed
+evidence/
