@@ -306,8 +306,8 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
       break;
     fpit->owner = caller->mm;
 
-    /* Tracking for later page replacement activities */
-    enlist_pgn_node(&caller->mm->fifo_pgn, pgn + pgit);
+    /* Tracking for later page replacement activities (libmem.c) */
+    mm_page_resident(caller->mm, pgn + pgit);
     fpit = fpit->fp_next;
   }
 
@@ -337,7 +337,9 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
     return -1;
 
   for (pgit = 0; pgit < req_pgnum; pgit++) {
-    if (MEMPHY_get_freefp(caller->krnl->mram, &fpn) != 0) {
+    /* RAM used up: swap a victim page out to reuse its frame (T3) */
+    if (MEMPHY_get_freefp(caller->krnl->mram, &fpn) != 0
+        && vm_evict_page(caller, &fpn) != 0) {
       /* Obtained some but not enough frames: give them back so the
        * caller sees an all-or-nothing allocation, report out of memory.
        */
@@ -497,6 +499,7 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
   memset(mm->symrgtbl, 0, sizeof(mm->symrgtbl));
   mm->fifo_pgn = NULL;
   mm->kcpooltbl = NULL;
+  memset(&mm->stat, 0, sizeof(mm->stat));
 
   (void) caller;
   return 0;
@@ -690,6 +693,42 @@ addr_t mm64_pgtbl_stats(struct mm_struct *mm, int ntbl[5])
 
   return (addr_t) (cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4])
          * PAGING64_PTRS_PER_TBL * sizeof(addr_t);
+}
+
+/*
+ * mm64_for_each_pte - call @fn for every non-zero PTE of @mm
+ * Stop and return the value of @fn when it is not 0.
+ */
+int mm64_for_each_pte(struct mm_struct *mm,
+                      int (*fn)(addr_t pgn, addr_t pte, void *arg), void *arg)
+{
+  addr_t i0, i1, i2, i3, i4;
+  addr_t *p4d, *pud, *pmd, *pt;
+  int ret;
+
+  if (mm == NULL || mm->pgd == NULL || fn == NULL)
+    return 0;
+
+  for (i0 = 0; i0 < PAGING64_PTRS_PER_TBL; i0++) {
+    if ((p4d = (addr_t *) mm->pgd[i0]) == NULL) continue;
+    for (i1 = 0; i1 < PAGING64_PTRS_PER_TBL; i1++) {
+      if ((pud = (addr_t *) p4d[i1]) == NULL) continue;
+      for (i2 = 0; i2 < PAGING64_PTRS_PER_TBL; i2++) {
+        if ((pmd = (addr_t *) pud[i2]) == NULL) continue;
+        for (i3 = 0; i3 < PAGING64_PTRS_PER_TBL; i3++) {
+          if ((pt = (addr_t *) pmd[i3]) == NULL) continue;
+          for (i4 = 0; i4 < PAGING64_PTRS_PER_TBL; i4++) {
+            if (pt[i4] == 0) continue;
+            ret = fn((((((i0 << 9 | i1) << 9 | i2) << 9 | i3) << 9) | i4),
+                     pt[i4], arg);
+            if (ret != 0)
+              return ret;
+          }
+        }
+      }
+    }
+  }
+  return 0;
 }
 
 /*

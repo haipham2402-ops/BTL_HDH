@@ -15,6 +15,9 @@
 #define SYSMEM_SWP_OP 3
 #define SYSMEM_IO_READ 4
 #define SYSMEM_IO_WRITE 5
+#define SYSMEM_SWPIN_OP 6   /* copy a frame MEMSWP[a4] (a2) -> MEMRAM (a3) */
+
+int mm_report_and_release(struct pcb_t *proc);
 
 extern struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid);
 int liballoc(struct pcb_t *, addr_t, uint32_t);

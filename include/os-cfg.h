@@ -21,6 +21,16 @@
 #define IODUMP 1
 #define PAGETBL_DUMP 1
 
+/* Page replacement (global, over the resident pages of all processes):
+ * FIFO by default, define MM_REPLACE_LRU to use LRU instead.
+ */
+//#define MM_REPLACE_LRU 1
+
+/* Print the memory statistics of a process when it finishes
+ * (memory accesses, page faults, swaps, page table size).
+ */
+#define MM_STATS_DUMP 1
+
 /* 
  * @bksysnet:
  *    The address mode must be explicitly define in MM64 or no-MM64

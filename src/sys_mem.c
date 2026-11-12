@@ -12,7 +12,9 @@
 #include "syscall.h"
 #include "libmem.h"
 #include "queue.h"
+#include "sched.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifdef MM64
 #include "mm64.h"
@@ -25,49 +27,57 @@
 int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs* regs)
 {
    int memop = regs->a1;
+   int ret = 0;
    BYTE value;
-   /* 
-    * TODO THIS DUMMY CREATE EMPTY PROC TO AVOID COMPILER NOTIFY 
-    *      need to be eliminated
-	*/
-   struct pcb_t *caller = malloc(sizeof(struct pcb_t));
-   caller->krnl = malloc(sizeof(struct krnl_t));
 
    /*
     * @bksysnet: Please note in the dual spacing design
     *            syscall implementations are in kernel space.
+    *
+    * User space only passes its PID; the kernel looks the process up
+    * in its own lists (user processes never hand a PCB to the kernel).
     */
+   struct pcb_t *caller = find_proc_by_pid(pid);
 
-   /* TODO: Traverse proclist to terminate the proc
-    *       stcmp to check the process match proc_name
-    */
-
-    /* TODO Maching and marking the process */
-    /* user process are not allowed to access directly pcb in kernel space of syscall */
-    //....
+   if (caller == NULL) {
+      printf("[ERROR] sys_memmap: no live process with PID %u\n", pid);
+      return -1;
+   }
 
    switch (memop) {
    case SYSMEM_MAP_OP:
             /* Reserved process case*/
-			vmap_pgd_memset(caller, regs->a2, regs->a3);
+            ret = vmap_pgd_memset(caller, regs->a2, regs->a3);
             break;
    case SYSMEM_INC_OP:
-            inc_vma_limit(caller, regs->a2, regs->a3);
+            ret = inc_vma_limit(caller, regs->a2, regs->a3);
             break;
    case SYSMEM_SWP_OP:
-            __mm_swap_page(caller, regs->a2, regs->a3);
+            /* MEMRAM frame a2 --> active MEMSWP frame a3 */
+            ret = __mm_swap_page(caller, regs->a2, regs->a3);
+            break;
+   case SYSMEM_SWPIN_OP:
+            /* MEMSWP[a4] frame a2 --> MEMRAM frame a3 */
+            if (regs->a4 == krnl->active_mswp_id)
+               ret = __swap_cp_page(krnl->active_mswp, regs->a2, krnl->mram, regs->a3);
+            else if (regs->a4 < PAGING_MAX_MMSWP)
+               ret = __swap_cp_page(&((struct memphy_struct *) krnl->mswp)[regs->a4],
+                                    regs->a2, krnl->mram, regs->a3);
+            else
+               ret = -1;
             break;
    case SYSMEM_IO_READ:
-            MEMPHY_read(krnl->mram, regs->a2, &value);
-            regs->a3 = value;
+            ret = MEMPHY_read(krnl->mram, regs->a2, &value);
+            regs->a3 = (unsigned char) value;
             break;
    case SYSMEM_IO_WRITE:
-            MEMPHY_write(krnl->mram, regs->a2, regs->a3);
+            ret = MEMPHY_write(krnl->mram, regs->a2, regs->a3);
             break;
    default:
             printf("Memop code: %d\n", memop);
+            ret = -1;
             break;
    }
    
-   return 0;
+   return ret;
 }

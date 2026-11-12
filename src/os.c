@@ -15,6 +15,7 @@
 #include "mm.h"
 #ifdef MM64
 #include "mm64.h"
+#include "libmem.h"
 #endif
 
 #include <pthread.h>
@@ -81,6 +82,11 @@ static void * cpu_routine(void * args) {
 			/* The porcess has finish it job */
 			printf("\tCPU %d: Processed %2d has finished\n",
 				id ,proc->pid);
+#ifdef MM_PAGING
+			/* Memory statistics + give the frames back (T3) */
+			mm_report_and_release(proc);
+#endif
+			finish_proc(proc);
 			free(proc);
 			proc = get_proc();
 			time_left = 0;
