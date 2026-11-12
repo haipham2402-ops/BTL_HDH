@@ -3,11 +3,11 @@ obj/
 *.o
 *.a
 *.so
-os
-mem
-sched
-pdg
-dma_testbench
+/os
+/mem
+/sched
+/pdg
+/dma_testbench
 src/syscalltbl.lst
 
 # Verilator / simulation traces
