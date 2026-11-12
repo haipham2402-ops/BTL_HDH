@@ -18,8 +18,84 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 
 #if defined(MM64)
+
+/*
+ * Multi-level page table layout (5 levels, 4KB pages, 57-bit address):
+ *
+ *   bits 56..48  47..39  38..30  29..21  20..12   11..0
+ *        PGD     P4D     PUD     PMD     PT       offset
+ *
+ * Every directory is an array of PAGING64_PTRS_PER_TBL (512) entries.
+ * A non-zero entry of PGD/P4D/PUD/PMD holds the address of the next
+ * level table; an entry of PT holds the PTE (format in mm.h).
+ * Lower level tables are allocated on demand, so a process only pays
+ * for the part of the address space it actually maps.
+ * Each process owns its own tree, rooted at mm->pgd.
+ */
+
+/* Return the next-level table stored in tbl[idx], allocate it if asked */
+static addr_t *
+pgtbl_next(addr_t *tbl, addr_t idx, int alloc)
+{
+  if (tbl[idx] == 0) {
+    if (!alloc)
+      return NULL;
+    addr_t *next = calloc(PAGING64_PTRS_PER_TBL, sizeof(addr_t));
+    if (next == NULL)
+      return NULL;
+    tbl[idx] = (addr_t) next;
+  }
+  return (addr_t *) tbl[idx];
+}
+
+/*
+ * pgtbl_walk - walk the 5-level tree of @mm down to the PTE of @pgn
+ * @alloc : create missing directories on the way
+ * @dirs  : (optional) receives the PGD, P4D, PUD, PMD, PT tables visited
+ * Return the PTE address, or NULL if it is not mapped (alloc == 0)
+ * or memory is exhausted.
+ */
+static addr_t *
+pgtbl_walk(struct mm_struct *mm, addr_t pgn, int alloc, addr_t *dirs[5])
+{
+  addr_t idx[5];
+  addr_t *tbl;
+  int lv;
+
+  if (dirs != NULL)
+    for (lv = 0; lv < 5; lv++)
+      dirs[lv] = NULL;
+
+  if (mm == NULL || mm->pgd == NULL)
+    return NULL;
+
+  get_pd_from_pagenum(pgn, &idx[0], &idx[1], &idx[2], &idx[3], &idx[4]);
+
+  tbl = mm->pgd;
+  for (lv = 0; lv < 4; lv++) {
+    if (dirs != NULL)
+      dirs[lv] = tbl;
+    tbl = pgtbl_next(tbl, idx[lv], alloc);
+    if (tbl == NULL)
+      return NULL;
+  }
+  if (dirs != NULL)
+    dirs[4] = tbl;
+
+  return &tbl[idx[4]];
+}
+
+/* The page table of a process lives in its own mm */
+static struct mm_struct *
+pgtbl_owner(struct mm_struct *mm, struct pcb_t *caller)
+{
+  if (mm != NULL)
+    return mm;
+  return (caller != NULL) ? caller->mm : NULL;
+}
 
 /*
  * init_pte - Initialize PTE entry
@@ -77,8 +153,6 @@ int get_pd_from_address(addr_t addr, addr_t* pgd, addr_t* p4d, addr_t* pud, addr
 	*pmd = (addr&PAGING64_ADDR_PMD_MASK)>>PAGING64_ADDR_PMD_LOBIT;
 	*pt = (addr&PAGING64_ADDR_PT_MASK)>>PAGING64_ADDR_PT_LOBIT;
 
-	/* TODO: implement the page direactories mapping */
-
 	return 0;
 }
 
@@ -107,28 +181,16 @@ int get_pd_from_pagenum(addr_t pgn, addr_t* pgd, addr_t* p4d, addr_t* pud, addr_
  */
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 {
-  struct krnl_t *krnl = caller->krnl;
-
   addr_t *pte;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-#else
-  pte = &krnl->mm->pgd[pgn];
-#endif
-	
+
+  if (caller == NULL)
+    return -1;
+
+  /* The swapped page belongs to the caller's own page table */
+  pte = pgtbl_walk(caller->mm, pgn, 1, NULL);
+  if (pte == NULL)
+    return -1;
+
   CLRBIT(*pte, PAGING_PTE_PRESENT_MASK);
   SETBIT(*pte, PAGING_PTE_SWAPPED_MASK);
 
@@ -146,27 +208,18 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
  */
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
+  addr_t *pte;
 
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-#else
-  pte = &krnl->mm->pgd[pgn];
-#endif
+  /* FPN field of the PTE is bits 0..12 */
+  if (fpn > (PAGING_PTE_FPN_MASK >> PAGING_PTE_FPN_LOBIT)) {
+    printf("[ERROR] %s: fpn " FORMAT_ADDR " does not fit in PTE\n",
+           __func__, fpn);
+    return -1;
+  }
+
+  pte = pgtbl_walk(pgtbl_owner(mm, caller), pgn, 1, NULL);
+  if (pte == NULL)
+    return -1;
 
   SETBIT(*pte, PAGING_PTE_PRESENT_MASK);
   CLRBIT(*pte, PAGING_PTE_SWAPPED_MASK);
@@ -176,7 +229,6 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
   return 0;
 }
 
-
 /* Get PTE page table entry
  * @caller : caller
  * @pgn    : page number
@@ -185,29 +237,10 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
  **/
 addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
+  /* Read only: never create directories, an unmapped page reads as 0 */
+  addr_t *pte = pgtbl_walk(pgtbl_owner(mm, caller), pgn, 0, NULL);
 
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-#else	
-  pte = &krnl->mm->pgd[pgn];
-#endif
-
-  return (addr_t) &pte;
+  return (pte != NULL) ? *pte : 0;
 }
 
 /* Set PTE page table entry
@@ -217,29 +250,13 @@ addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
  **/
 int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
+  addr_t *pte = pgtbl_walk(pgtbl_owner(mm, caller), pgn, 1, NULL);
 
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-#else	
-  pte = pte_val;
-#endif
+  if (pte == NULL)
+    return -1;
 
-	return 0;
+  *pte = pte_val;
+  return 0;
 }
 
 /*
@@ -249,11 +266,20 @@ int vmap_pgd_memset(struct pcb_t *caller,           // process call
                     addr_t addr,                       // start address which is aligned to pagesz
                     int pgnum)                      // num of mapping page
 {
-  //int pgit = 0;
-  //uint64_t pattern = 0xdeadbeef;
-
-  /* TODO memset the page table with given pattern
+  /* Reserve the page table of [addr, addr + pgnum * PAGESZ): build the
+   * directories and fill the PTEs with a pattern that is NOT present,
+   * so a later access still goes through the normal page fault path.
    */
+  addr_t pattern = 0;
+  addr_t pgn = PAGING64_ADDR_PGN(addr);
+  int pgit;
+
+  if (caller == NULL || pgnum < 0)
+    return -1;
+
+  for (pgit = 0; pgit < pgnum; pgit++)
+    if (pte_set_entry(caller->mm, pgn + pgit, pattern, caller) != 0)
+      return -1;
 
   return 0;
 }
@@ -267,28 +293,31 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
                     struct framephy_struct *frames, // list of the mapped frames
                     struct vm_rg_struct *ret_rg)    // return mapped region, the real mapped fp
 {                                                   // no guarantee all given pages are mapped
-//struct framephy_struct *fpit;
-//int pgit = 0;
-//addr_t pgn;
+  struct framephy_struct *fpit = frames;
+  addr_t pgn = PAGING64_ADDR_PGN(addr);
+  int pgit = 0;
 
-  /* TODO: update the rg_end and rg_start of ret_rg 
-  //ret_rg->rg_end =  ....
-  //ret_rg->rg_start = ...
-  //ret_rg->vmaid = ...
-  */
+  if (caller == NULL || caller->mm == NULL)
+    return -1;
 
-  /* TODO map range of frame to address space
-   *      [addr to addr + pgnum*PAGING_PAGESZ
-   *      in page table caller->krnl->mm->pgd,
-   *                    caller->krnl->mm->pud...
-   *                    ...
-   */
+  /* Map page by page, in the order of the frame list */
+  for (pgit = 0; pgit < pgnum && fpit != NULL; pgit++) {
+    if (pte_set_fpn(caller->mm, pgn + pgit, fpit->fpn, caller) != 0)
+      break;
+    fpit->owner = caller->mm;
 
-  /* Tracking for later page replacement activities (if needed)
-   * Enqueue new usage page */
-  //enlist_pgn_node(&caller->krnl->mm->fifo_pgn, pgn64 + pgit);
+    /* Tracking for later page replacement activities */
+    enlist_pgn_node(&caller->mm->fifo_pgn, pgn + pgit);
+    fpit = fpit->fp_next;
+  }
 
-  return 0;
+  /* The region really mapped (may be shorter than requested) */
+  if (ret_rg != NULL) {
+    ret_rg->rg_start = addr;
+    ret_rg->rg_end = addr + (addr_t) pgit * PAGING64_PAGESZ;
+  }
+
+  return (pgit == pgnum) ? 0 : (addr_t) -1;
 }
 
 /*
@@ -300,34 +329,42 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
 
 addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_struct **frm_lst)
 {
-  //addr_t fpn;
-  //int pgit;
-  //struct framephy_struct *newfp_str = NULL;
-  //struct framephy_struct **cur = frm_lst;
+  struct framephy_struct *head = NULL, *tail = NULL, *newfp_str;
+  addr_t fpn;
+  int pgit;
 
-  /* TODO: allocate the page 
-  //caller-> ...
-  //frm_lst-> ...
-  */
+  if (caller == NULL || caller->krnl == NULL || frm_lst == NULL)
+    return -1;
 
-
-/*
-  for (pgit = 0; pgit < req_pgnum; pgit++)
-  {
-    // TODO: allocate the page 
-    if (MEMPHY_get_freefp(caller->mram, &fpn) == 0)
-    {
-      newfp_str->fpn = fpn;
+  for (pgit = 0; pgit < req_pgnum; pgit++) {
+    if (MEMPHY_get_freefp(caller->krnl->mram, &fpn) != 0) {
+      /* Obtained some but not enough frames: give them back so the
+       * caller sees an all-or-nothing allocation, report out of memory.
+       */
+      while (head != NULL) {
+        newfp_str = head->fp_next;
+        MEMPHY_put_freefp(caller->krnl->mram, head->fpn);
+        free(head);
+        head = newfp_str;
+      }
+      *frm_lst = NULL;
+      return -3000;
     }
+
+    newfp_str = malloc(sizeof(struct framephy_struct));
+    newfp_str->fpn = fpn;
+    newfp_str->fp_next = NULL;
+    newfp_str->owner = caller->mm;
+
+    /* Keep the request order: page i maps to the i-th frame */
+    if (tail == NULL)
+      head = newfp_str;
     else
-    { // TODO: ERROR CODE of obtaining somes but not enough frames
-    }
+      tail->fp_next = newfp_str;
+    tail = newfp_str;
   }
-*/
 
-
-  /* End TODO */
-
+  *frm_lst = head;
   return 0;
 }
 
@@ -365,9 +402,28 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
 
   /* it leaves the case of memory is enough but half in ram, half in swap
    * do the swaping all to swapper to get the all in ram */
-   vmap_page_range(caller, mapstart, incpgnum, frm_lst, ret_rg);
+  if (vmap_page_range(caller, mapstart, incpgnum, frm_lst, ret_rg) != 0) {
+    /* Unmapped frames go back to RAM */
+    struct framephy_struct *fp = frm_lst;
+    addr_t mapped = (ret_rg != NULL) ?
+      (ret_rg->rg_end - ret_rg->rg_start) / PAGING64_PAGESZ : 0;
+    while (fp != NULL && mapped > 0) { fp = fp->fp_next; mapped--; }
+    while (fp != NULL) {
+      MEMPHY_put_freefp(caller->krnl->mram, fp->fpn);
+      fp = fp->fp_next;
+    }
+    ret_alloc = -1;
+  }
 
-  return 0;
+  /* The list only carried the frame numbers; the frames themselves are
+   * tracked by the PTEs and the used list of MEMRAM */
+  while (frm_lst != NULL) {
+    struct framephy_struct *next = frm_lst->fp_next;
+    free(frm_lst);
+    frm_lst = next;
+  }
+
+  return (ret_alloc == 0) ? 0 : (addr_t) -1;
 }
 
 /* Swap copy content page from source frame to destination frame
@@ -410,33 +466,39 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 {
   struct vm_area_struct *vma0 = malloc(sizeof(struct vm_area_struct));
 
-  /* TODO init page table directory */
-   //mm->pgd = ...
-   //mm->p4d = ...
-   //mm->pud = ...
-   //mm->pmd = ...
-   //mm->pt = ...
+  if (mm == NULL || vma0 == NULL)
+    return -1;
 
+  /* Page table directory: only the root is allocated, the lower
+   * levels are created on demand by pgtbl_walk(). The p4d..pt fields
+   * are kept for compatibility and are not used as a cache.
+   */
+  mm->pgd = calloc(PAGING64_PTRS_PER_TBL, sizeof(addr_t));
+  mm->p4d = NULL;
+  mm->pud = NULL;
+  mm->pmd = NULL;
+  mm->pt = NULL;
 
   /* By default the owner comes with at least one vma */
   vma0->vm_id = 0;
   vma0->vm_start = 0;
   vma0->vm_end = vma0->vm_start;
   vma0->sbrk = vma0->vm_start;
+  vma0->vm_freerg_list = NULL;
   struct vm_rg_struct *first_rg = init_vm_rg(vma0->vm_start, vma0->vm_end);
   enlist_vm_rg_node(&vma0->vm_freerg_list, first_rg);
 
-  /* TODO update VMA0 next */
-  // vma0->next = ...
+  vma0->vm_next = NULL;
 
   /* Point vma owner backward */
-  //vma0->vm_mm = mm; 
+  vma0->vm_mm = mm;
 
-  /* TODO: update mmap */
-  //mm->mmap = ...
-  //mm->symrgtbl = ...
-  //mm->kcpooltbl
+  mm->mmap = vma0;
+  memset(mm->symrgtbl, 0, sizeof(mm->symrgtbl));
+  mm->fifo_pgn = NULL;
+  mm->kcpooltbl = NULL;
 
+  (void) caller;
   return 0;
 }
 
@@ -534,20 +596,129 @@ int print_list_pgn(struct pgn_t *ip)
 
 int print_pgtbl(struct pcb_t *caller, addr_t start, addr_t end)
 {
-//addr_t pgn = ...
-//addr_t pgit = ...
-//struct mm_struct *mm = ...
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
+  addr_t *dirs[5];
 
-  get_pd_from_address(start, &pgd, &p4d, &pud, &pmd, &pt);
+  if (caller == NULL || caller->mm == NULL)
+    return -1;
 
-  /* TODO traverse the page map and dump the page directory entries */
+  /* Dump the directories that translate @start (same format as the
+   * sample output); missing levels are printed as 0.
+   */
+  pgtbl_walk(caller->mm, PAGING64_ADDR_PGN(start), 0, dirs);
+  printf(" PDG=%016lx P4g=%016lx PUD=%016lx PMD=%016lx\n",
+         (unsigned long) dirs[0], (unsigned long) dirs[1],
+         (unsigned long) dirs[2], (unsigned long) dirs[3]);
 
+  (void) end;
   return 0;
+}
+
+/*
+ * print_pgtbl_entries - list every PTE in use of @caller
+ * One line per page: virtual page, FPN (present) or swap offset.
+ */
+int print_pgtbl_entries(struct pcb_t *caller)
+{
+  addr_t i0, i1, i2, i3, i4;
+  addr_t *p4d, *pud, *pmd, *pt;
+
+  if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL)
+    return -1;
+
+  printf("print_pgtbl_entries: PID %d\n", caller->pid);
+  for (i0 = 0; i0 < PAGING64_PTRS_PER_TBL; i0++) {
+    if ((p4d = (addr_t *) caller->mm->pgd[i0]) == NULL) continue;
+    for (i1 = 0; i1 < PAGING64_PTRS_PER_TBL; i1++) {
+      if ((pud = (addr_t *) p4d[i1]) == NULL) continue;
+      for (i2 = 0; i2 < PAGING64_PTRS_PER_TBL; i2++) {
+        if ((pmd = (addr_t *) pud[i2]) == NULL) continue;
+        for (i3 = 0; i3 < PAGING64_PTRS_PER_TBL; i3++) {
+          if ((pt = (addr_t *) pmd[i3]) == NULL) continue;
+          for (i4 = 0; i4 < PAGING64_PTRS_PER_TBL; i4++) {
+            addr_t pte = pt[i4];
+            addr_t pgn = (((((i0 << 9 | i1) << 9 | i2) << 9 | i3) << 9) | i4);
+            if (PAGING_PAGE_PRESENT(pte))
+              printf("  pgn %6lu -> fpn %lu\n",
+                     (unsigned long) pgn, (unsigned long) PAGING_FPN(pte));
+            else if (pte & PAGING_PTE_SWAPPED_MASK)
+              printf("  pgn %6lu -> swap type %lu off %lu\n",
+                     (unsigned long) pgn,
+                     (unsigned long) PAGING_PTE_SWPTYP(pte),
+                     (unsigned long) PAGING_SWP(pte));
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+ * mm64_pgtbl_stats - storage used by the page table tree of @mm
+ * @ntbl  : (optional) number of tables per level PGD, P4D, PUD, PMD, PT
+ * Return the total size in bytes of all allocated tables.
+ */
+addr_t mm64_pgtbl_stats(struct mm_struct *mm, int ntbl[5])
+{
+  int cnt[5] = {0, 0, 0, 0, 0};
+  addr_t i0, i1, i2, i3;
+  addr_t *p4d, *pud, *pmd;
+  int lv;
+
+  if (mm != NULL && mm->pgd != NULL) {
+    cnt[0] = 1;
+    for (i0 = 0; i0 < PAGING64_PTRS_PER_TBL; i0++) {
+      if ((p4d = (addr_t *) mm->pgd[i0]) == NULL) continue;
+      cnt[1]++;
+      for (i1 = 0; i1 < PAGING64_PTRS_PER_TBL; i1++) {
+        if ((pud = (addr_t *) p4d[i1]) == NULL) continue;
+        cnt[2]++;
+        for (i2 = 0; i2 < PAGING64_PTRS_PER_TBL; i2++) {
+          if ((pmd = (addr_t *) pud[i2]) == NULL) continue;
+          cnt[3]++;
+          for (i3 = 0; i3 < PAGING64_PTRS_PER_TBL; i3++)
+            if (pmd[i3] != 0)
+              cnt[4]++;
+        }
+      }
+    }
+  }
+
+  if (ntbl != NULL)
+    for (lv = 0; lv < 5; lv++)
+      ntbl[lv] = cnt[lv];
+
+  return (addr_t) (cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4])
+         * PAGING64_PTRS_PER_TBL * sizeof(addr_t);
+}
+
+/*
+ * mm64_free_pgtbl - release every directory of @mm (not the frames)
+ */
+void mm64_free_pgtbl(struct mm_struct *mm)
+{
+  addr_t i0, i1, i2, i3;
+  addr_t *p4d, *pud, *pmd;
+
+  if (mm == NULL || mm->pgd == NULL)
+    return;
+
+  for (i0 = 0; i0 < PAGING64_PTRS_PER_TBL; i0++) {
+    if ((p4d = (addr_t *) mm->pgd[i0]) == NULL) continue;
+    for (i1 = 0; i1 < PAGING64_PTRS_PER_TBL; i1++) {
+      if ((pud = (addr_t *) p4d[i1]) == NULL) continue;
+      for (i2 = 0; i2 < PAGING64_PTRS_PER_TBL; i2++) {
+        if ((pmd = (addr_t *) pud[i2]) == NULL) continue;
+        for (i3 = 0; i3 < PAGING64_PTRS_PER_TBL; i3++)
+          free((addr_t *) pmd[i3]);
+        free(pmd);
+      }
+      free(pud);
+    }
+    free(p4d);
+  }
+  free(mm->pgd);
+  mm->pgd = NULL;
 }
 
 #endif  //def MM64

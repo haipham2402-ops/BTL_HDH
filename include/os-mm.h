@@ -137,7 +137,7 @@ struct framephy_struct {
 struct memphy_struct {
    /* Basic field of data and size */
    BYTE *storage;
-   int maxsz;
+   addr_t maxsz;   /* addr_t: a 4GB device does not fit in int */
    
    /* Sequential device fields */ 
    int rdmflg;

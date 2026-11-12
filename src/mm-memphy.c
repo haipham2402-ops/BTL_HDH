@@ -19,6 +19,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+
+/* MEMRAM and MEMSWP are shared by all CPUs: protect the frame lists.
+ * Lock order (see team notes): mmvm_lock -> kmm_lock -> memphy_lock
+ */
+static pthread_mutex_t memphy_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  *  MEMPHY_mv_csr - move MEMPHY cursor
@@ -136,6 +142,8 @@ int MEMPHY_format(struct memphy_struct *mp, int pagesz)
    /* Init head of free framephy list */
    fst = malloc(sizeof(struct framephy_struct));
    fst->fpn = iter;
+   fst->fp_next = NULL;
+   fst->owner = NULL;
    mp->free_fp_list = fst;
 
    /* We have list with first element, fill in the rest num-1 element member*/
@@ -144,6 +152,7 @@ int MEMPHY_format(struct memphy_struct *mp, int pagesz)
       newfst = malloc(sizeof(struct framephy_struct));
       newfst->fpn = iter;
       newfst->fp_next = NULL;
+      newfst->owner = NULL;
       fst->fp_next = newfst;
       fst = newfst;
    }
@@ -153,45 +162,97 @@ int MEMPHY_format(struct memphy_struct *mp, int pagesz)
 
 int MEMPHY_get_freefp(struct memphy_struct *mp, addr_t *retfpn)
 {
-   struct framephy_struct *fp = mp->free_fp_list;
+   struct framephy_struct *fp;
 
-   if (fp == NULL)
+   if (mp == NULL || retfpn == NULL)
       return -1;
 
-   /* 
-    * TODO manage free frame list
-    */
-   //*retfpn ..
-   // cap nhat lai danh sach free frame
+   pthread_mutex_lock(&memphy_lock);
+   fp = mp->free_fp_list;
+   if (fp == NULL) {
+      /* MEMPHY is used up: no garbage collector, the caller must
+       * swap a page out (or report out of memory) */
+      pthread_mutex_unlock(&memphy_lock);
+      return -1;
+   }
 
-   /* 
-    * TODO MEMPHY is iteratively used up until its exhausted
-    * No garbage collector acting then it not been released
-    */
-   free(fp);
+   /* Take the head of the free list and keep the node in the used
+    * list to track allocated frames */
+   mp->free_fp_list = fp->fp_next;
+   *retfpn = fp->fpn;
+   fp->fp_next = mp->used_fp_list;
+   mp->used_fp_list = fp;
+   pthread_mutex_unlock(&memphy_lock);
 
    return 0;
 }
 
+/* Number of nodes of a frame list */
+static int count_fp(struct framephy_struct *fp)
+{
+   int n = 0;
+
+   for (; fp != NULL; fp = fp->fp_next)
+      n++;
+   return n;
+}
+
 int MEMPHY_dump(struct memphy_struct *mp)
 {
-  /*
-   * TODO dump memphy contnt mp->storage
-   *     for tracing the memory content
-   */
+   addr_t addr;
+   int nonzero = 0;
+
+   if (mp == NULL || mp->storage == NULL)
+      return -1;
+
+   pthread_mutex_lock(&memphy_lock);
+   printf("MEMPHY_dump: size=%lu free_frames=%d used_frames=%d\n",
+          (unsigned long) mp->maxsz, count_fp(mp->free_fp_list),
+          count_fp(mp->used_fp_list));
+   pthread_mutex_unlock(&memphy_lock);
+
+   /* Only the non-zero bytes, a full dump would be megabytes */
+   for (addr = 0; addr < mp->maxsz; addr++) {
+      if (mp->storage[addr] != 0) {
+         printf("  [0x%08lx] = 0x%02x\n", (unsigned long) addr,
+                (unsigned char) mp->storage[addr]);
+         nonzero++;
+      }
+   }
+   printf("MEMPHY_dump: %d non-zero byte(s)\n", nonzero);
 
    return 0;
 }
 
 int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn)
 {
-   struct framephy_struct *fp = mp->free_fp_list;
-   struct framephy_struct *newnode = malloc(sizeof(struct framephy_struct));
+   struct framephy_struct *prev = NULL, *node;
+
+   if (mp == NULL)
+      return -1;
+
+   pthread_mutex_lock(&memphy_lock);
+   /* Reuse the tracking node of the used list if it is there */
+   for (node = mp->used_fp_list; node != NULL; node = node->fp_next) {
+      if (node->fpn == fpn)
+         break;
+      prev = node;
+   }
+   if (node != NULL) {
+      if (prev == NULL)
+         mp->used_fp_list = node->fp_next;
+      else
+         prev->fp_next = node->fp_next;
+   } else {
+      node = malloc(sizeof(struct framephy_struct));
+      node->fpn = fpn;
+   }
 
    /* Create new node with value fpn */
-   newnode->fpn = fpn;
-   newnode->fp_next = fp;
-   mp->free_fp_list = newnode;
+   node->owner = NULL;
+   node->fp_next = mp->free_fp_list;
+   mp->free_fp_list = node;
+   pthread_mutex_unlock(&memphy_lock);
 
    return 0;
 }
@@ -201,9 +262,25 @@ int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn)
  */
 int init_memphy(struct memphy_struct *mp, addr_t max_size, int randomflg)
 {
-   mp->storage = (BYTE *)malloc(max_size * sizeof(BYTE));
+   mp->free_fp_list = NULL;
+   mp->used_fp_list = NULL;
+   mp->cursor = 0;
    mp->maxsz = max_size;
-   memset(mp->storage, 0, max_size * sizeof(BYTE));
+   mp->storage = NULL;
+
+   if (max_size == 0)  /* deactivated swap device */
+      return 0;
+
+   /* calloc instead of malloc + memset: zero pages are only backed by
+    * real memory when written, so a 4GB simulated RAM (MM_FIXED_MEMSZ)
+    * does not need 4GB of host memory */
+   mp->storage = (BYTE *)calloc(max_size, sizeof(BYTE));
+   if (mp->storage == NULL) {
+      printf("[ERROR] init_memphy: cannot allocate %lu bytes\n",
+             (unsigned long) max_size);
+      mp->maxsz = 0;
+      return -1;
+   }
 
 #ifdef MM64
    MEMPHY_format(mp, PAGING64_PAGESZ);
