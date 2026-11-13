@@ -17,6 +17,7 @@
 #include "syscall.h"
 #include "libmem.h"
 #include "dma.h"
+#include "dma_queue.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -36,9 +37,24 @@ static int get_free_rg_in_vma(struct vm_area_struct *cur_vma, addr_t size,
 struct resident_node {
   struct mm_struct *mm;
   addr_t pgn;
+  unsigned int pins;
   struct resident_node *next;
 };
 static struct resident_node *res_head = NULL, *res_tail = NULL;
+
+struct dma_pin_ref {
+  struct mm_struct *mm;
+  addr_t pgn;
+  struct dma_pin_ref *next;
+};
+
+struct dma_job_t {
+  struct pcb_t *caller;
+  uint32_t src_rg, dst_rg, offset, size;
+  size_t remaining;
+  int status;
+  struct dma_pin_ref *pins;
+};
 
 /* Remove pgn from a per-process page list (mm->fifo_pgn) */
 static void pgn_list_remove(struct pgn_t **plist, addr_t pgn)
@@ -67,6 +83,7 @@ void mm_page_resident(struct mm_struct *mm, addr_t pgn)
 
   node->mm = mm;
   node->pgn = pgn;
+  node->pins = 0;
   node->next = NULL;
   if (res_tail == NULL)
     res_head = node;
@@ -75,6 +92,30 @@ void mm_page_resident(struct mm_struct *mm, addr_t pgn)
   res_tail = node;
 
   enlist_pgn_node(&mm->fifo_pgn, pgn);
+}
+
+static int resident_pin(struct mm_struct *mm, addr_t pgn)
+{
+  struct resident_node *it;
+
+  for (it = res_head; it != NULL; it = it->next)
+    if (it->mm == mm && it->pgn == pgn) {
+      it->pins++;
+      return 0;
+    }
+  return -1;
+}
+
+static void resident_unpin(struct mm_struct *mm, addr_t pgn)
+{
+  struct resident_node *it;
+
+  for (it = res_head; it != NULL; it = it->next)
+    if (it->mm == mm && it->pgn == pgn) {
+      if (it->pins > 0)
+        it->pins--;
+      return;
+    }
 }
 
 /* Unlink a node from the queue, prev is its predecessor (or NULL) */
@@ -142,10 +183,14 @@ static struct memphy_struct *swap_dev(struct krnl_t *krnl, int id)
  */
 static int evict_one(struct pcb_t *caller, addr_t *retfpn, int via_syscall)
 {
-  struct resident_node *victim = res_head;
+  struct resident_node *victim = res_head, *victim_prev = NULL;
   struct krnl_t *krnl = caller->krnl;
   addr_t vicpte, vicfpn, swpfpn, swppte = 0;
 
+  while (victim != NULL && victim->pins != 0) {
+    victim_prev = victim;
+    victim = victim->next;
+  }
   if (victim == NULL)
     return -1;  /* nothing resident to replace */
 
@@ -178,7 +223,7 @@ static int evict_one(struct pcb_t *caller, addr_t *retfpn, int via_syscall)
   victim->mm->stat.evicted++;
   caller->mm->stat.swap_out++;
   pgn_list_remove(&victim->mm->fifo_pgn, victim->pgn);
-  resident_unlink(NULL, victim);
+  resident_unlink(victim_prev, victim);
   free(victim);
 
   *retfpn = vicfpn;
@@ -813,24 +858,6 @@ int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
  *@offset: memory offset
  *@size: copied data size
  */
-int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t offset, uint32_t size)
-{
-  /* TODO: provide DMA mempy */
-
-  //struct krnl_t *krnl = caller->krnl;
-
-  /*
-   *  TODO: provide asynchronous dma memcpy
-   *        handling the dma_done_callback
-   */
-  //do_dma(caller, (uint64_t) src, (uint64_t) dst, (uint64_t) size);
-  //krnl->...
-  //krnl->...
-
-  return 0;
-}
-
-
 /* Physical address of kernel virtual address @kaddr (never swapped) */
 static int kmem_phys(struct krnl_t *krnl, addr_t kaddr, addr_t *phys)
 {
@@ -840,6 +867,224 @@ static int kmem_phys(struct krnl_t *krnl, addr_t kaddr, addr_t *phys)
     return -1;
   *phys = PAGING_FPN(pte) * PAGING64_PAGESZ + PAGING64_ADDR_OFFST(kaddr);
   return 0;
+}
+
+static int dma_pin_user_page(struct dma_job_t *job, addr_t pgn)
+{
+  struct dma_pin_ref *pin;
+
+  for (pin = job->pins; pin != NULL; pin = pin->next)
+    if (pin->mm == job->caller->mm && pin->pgn == pgn)
+      return 0;
+
+  pin = malloc(sizeof(*pin));
+  if (pin == NULL)
+    return -1;
+  if (resident_pin(job->caller->mm, pgn) != 0) {
+    free(pin);
+    return -1;
+  }
+  pin->mm = job->caller->mm;
+  pin->pgn = pgn;
+  pin->next = job->pins;
+  job->pins = pin;
+  return 0;
+}
+
+static int dma_translate(struct dma_job_t *job, struct vm_rg_struct *rg,
+                         addr_t region_offset, addr_t *phys)
+{
+  addr_t addr = rg->rg_start + region_offset;
+  addr_t pgn = PAGING64_ADDR_PGN(addr);
+  int fpn;
+
+  if (rg->mode_bit == RG_MODE_KERNEL)
+    return kmem_phys(job->caller->krnl, addr, phys);
+
+  if (pg_getpage(job->caller->mm, pgn, &fpn, job->caller) != 0
+      || dma_pin_user_page(job, pgn) != 0)
+    return -1;
+  *phys = (addr_t) fpn * PAGING64_PAGESZ + PAGING64_ADDR_OFFST(addr);
+  return 0;
+}
+
+static void dma_release_pins(struct dma_job_t *job)
+{
+  struct dma_pin_ref *pin, *next;
+
+  pthread_mutex_lock(&mmvm_lock);
+  for (pin = job->pins; pin != NULL; pin = next) {
+    next = pin->next;
+    resident_unpin(pin->mm, pin->pgn);
+    free(pin);
+  }
+  pthread_mutex_unlock(&mmvm_lock);
+}
+
+int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst,
+                      uint32_t offset, uint32_t size)
+{
+  struct dma_job_t *job = NULL;
+  struct dma_req_t *req_head = NULL, *req_tail = NULL, *req;
+  struct vm_rg_struct *src_rg, *dst_rg;
+  uint64_t remaining, current;
+  const char *failure = "invalid";
+
+  if (caller == NULL || caller->krnl == NULL || caller->mm == NULL
+      || caller->krnl->mram == NULL || size == 0
+      || src >= PAGING_MAX_SYMTBL_SZ || dst >= PAGING_MAX_SYMTBL_SZ) {
+    if (caller != NULL)
+      printf("[ERROR] PID %d: dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u invalid\n",
+             caller->pid, src, dst, offset, size);
+    return -1;
+  }
+
+  job = calloc(1, sizeof(*job));
+  if (job == NULL) {
+    failure = "DMA request allocation failed";
+    goto cleanup_invalid;
+  }
+  job->caller = caller;
+  job->src_rg = src;
+  job->dst_rg = dst;
+  job->offset = offset;
+  job->size = size;
+
+  pthread_mutex_lock(&mmvm_lock);
+  pthread_mutex_lock(&kmm_lock);
+  src_rg = get_symrg_byid(caller->mm, src);
+  dst_rg = get_symrg_byid(caller->mm, dst);
+  if (src_rg == NULL || dst_rg == NULL
+      || src_rg->rg_start >= src_rg->rg_end
+      || dst_rg->rg_start >= dst_rg->rg_end
+      || (src_rg->mode_bit != RG_MODE_USER && src_rg->mode_bit != RG_MODE_KERNEL)
+      || (dst_rg->mode_bit != RG_MODE_USER && dst_rg->mode_bit != RG_MODE_KERNEL)
+      || (uint64_t) offset > src_rg->rg_end - src_rg->rg_start
+      || (uint64_t) offset > dst_rg->rg_end - dst_rg->rg_start
+      || (uint64_t) size > src_rg->rg_end - src_rg->rg_start - offset
+      || (uint64_t) size > dst_rg->rg_end - dst_rg->rg_start - offset)
+    goto unlock_invalid;
+
+  remaining = size;
+  current = offset;
+  while (remaining > 0) {
+    addr_t src_phys, dst_phys;
+    uint64_t src_addr = src_rg->rg_start + current;
+    uint64_t dst_addr = dst_rg->rg_start + current;
+    uint64_t chunk = remaining;
+    uint64_t src_page_left = PAGING64_PAGESZ - PAGING64_ADDR_OFFST(src_addr);
+    uint64_t dst_page_left = PAGING64_PAGESZ - PAGING64_ADDR_OFFST(dst_addr);
+
+    if (chunk > src_page_left)
+      chunk = src_page_left;
+    if (chunk > dst_page_left)
+      chunk = dst_page_left;
+    if (dma_translate(job, src_rg, current, &src_phys) != 0
+        || dma_translate(job, dst_rg, current, &dst_phys) != 0) {
+      failure = "DMA address translation failed";
+      goto unlock_invalid;
+    }
+
+    req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+      failure = "DMA request allocation failed";
+      goto unlock_invalid;
+    }
+    if (pthread_cond_init(&req->done_cv, NULL) != 0) {
+      free(req);
+      failure = "DMA request initialization failed";
+      goto unlock_invalid;
+    }
+    req->caller = caller;
+    req->job = job;
+    req->src = src_phys;
+    req->dst = dst_phys;
+    req->len = chunk;
+    if (req_tail == NULL)
+      req_head = req;
+    else
+      req_tail->next = req;
+    req_tail = req;
+    job->remaining++;
+
+    current += chunk;
+    remaining -= chunk;
+  }
+
+  pthread_mutex_unlock(&kmm_lock);
+  pthread_mutex_unlock(&mmvm_lock);
+
+  if (scheduler_dma_begin(caller) != 0) {
+    failure = "DMA scheduler rejected request";
+    goto submit_invalid;
+  }
+  for (req = req_head; req != NULL; req = req->next)
+    printf("DMA SUBMIT pid=%d src=0x%lx dst=0x%lx len=%lu\n",
+           caller->pid, (unsigned long) req->src, (unsigned long) req->dst,
+           (unsigned long) req->len);
+  if (dma_submit_batch(req_head, job->remaining) != 0) {
+    scheduler_dma_cancel(caller);
+    failure = "DMA queue rejected request";
+    goto submit_invalid;
+  }
+  return DMA_MEMCPY_PENDING;
+
+unlock_invalid:
+  pthread_mutex_unlock(&kmm_lock);
+  pthread_mutex_unlock(&mmvm_lock);
+  goto cleanup_invalid;
+
+submit_invalid:
+  scheduler_dma_cancel(caller);
+
+cleanup_invalid:
+  req = req_head;
+  while (req != NULL) {
+    struct dma_req_t *next = req->next;
+    pthread_cond_destroy(&req->done_cv);
+    free(req);
+    req = next;
+  }
+  if (job != NULL) {
+    if (job->pins != NULL)
+      dma_release_pins(job);
+    free(job);
+  }
+  if (strcmp(failure, "invalid") == 0)
+    printf("[ERROR] PID %d: dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u invalid\n",
+           caller->pid, src, dst, offset, size);
+  else
+    printf("[ERROR] PID %d: %s for dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u\n",
+           caller->pid, failure, src, dst, offset, size);
+  return -1;
+}
+
+void libmem_dma_complete(struct dma_req_t *req, int status)
+{
+  struct dma_job_t *job;
+
+  if (req == NULL)
+    return;
+  job = req->job;
+  printf("DMA IRQ pid=%d len=%lu status=%d\n", req->caller->pid,
+         (unsigned long) req->len, status);
+  if (status != 0)
+    job->status = status;
+
+  if (job->remaining > 0)
+    job->remaining--;
+  if (job->remaining == 0) {
+    dma_release_pins(job);
+    scheduler_dma_wake(job->caller);
+    if (job->status == 0)
+      printf("dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u done\n",
+             job->src_rg, job->dst_rg, job->offset, job->size);
+    free(job);
+  }
+
+  dma_complete(req, status);
+  pthread_cond_destroy(&req->done_cv);
+  free(req);
 }
 
 /*__read_kernel_mem - read value in kernel region memory

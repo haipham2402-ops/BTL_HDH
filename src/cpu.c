@@ -38,7 +38,8 @@ int free_data(struct pcb_t *proc, uint32_t reg_index)
 	return free_mem(proc->regs[reg_index], proc);
 }
 
-int read(
+#ifndef MM_PAGING
+static int cpu_read(
 	struct pcb_t *proc, // Process executing the instruction
 	uint32_t source,	// Index of source register
 	uint32_t offset,	// Source address = [source] + [offset]
@@ -57,7 +58,7 @@ int read(
 	}
 }
 
-int write(
+static int cpu_write(
 	struct pcb_t *proc,	// Process executing the instruction
 	BYTE data,		// Data to be wrttien into memory
 	uint32_t destination, // Index of destination register
@@ -66,6 +67,7 @@ int write(
 	// [destination] + [offset]
 	return write_mem(proc->regs[destination] + offset, proc, data);
 }
+#endif
 
 int run(struct pcb_t *proc)
 {
@@ -115,14 +117,14 @@ switch (ins.opcode)
 #ifdef MM_PAGING
 		stat = libread(proc, ins.arg_0, ins.arg_1, (uint32_t*) &ins.arg_2);
 #else
-		stat = read(proc, ins.arg_0, ins.arg_1, ins.arg_2);
+		stat = cpu_read(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #endif
 		break;
 	case WRITE:
 #ifdef MM_PAGING
 		stat = libwrite(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #else
-		stat = write(proc, ins.arg_0, ins.arg_1, ins.arg_2);
+		stat = cpu_write(proc, ins.arg_0, ins.arg_1, ins.arg_2);
 #endif
 		break;
 	case SYSCALL:

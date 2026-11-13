@@ -13,6 +13,8 @@
 #include "sched.h"
 #include "loader.h"
 #include "mm.h"
+#include "dma.h"
+#include "dma_queue.h"
 #ifdef MM64
 #include "mm64.h"
 #include "libmem.h"
@@ -24,13 +26,14 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #include "sysbus.h"
 #include "dpi_rtl.h"
 
 static int time_slot;
 static int num_cpus;
-static int done = 0;
+static atomic_int done = 0;
 static struct krnl_t os;
 
 #ifdef MM_PAGING
@@ -74,10 +77,6 @@ static void * cpu_routine(void * args) {
 			/* No process is running, the we load new process from
 		 	* ready queue */
 			proc = get_proc();
-			if (proc == NULL) {
-                           next_slot(timer_id);
-                           continue; /* First load failed. skip dummy load */
-                        }
 		}else if (proc->pc == proc->code->size) {
 			/* The porcess has finish it job */
 			printf("\tCPU %d: Processed %2d has finished\n",
@@ -99,7 +98,7 @@ static void * cpu_routine(void * args) {
 		}
 		
 		/* Recheck process status after loading new process */
-		if (proc == NULL && done) {
+		if (proc == NULL && done && dma_queue_pending() == 0) {
 			/* No process to run, exit */
 			printf("\tCPU %d stopped\n", id);
 			break;
@@ -115,8 +114,14 @@ static void * cpu_routine(void * args) {
 		}
 		
 		/* Run current process */
-		run(proc);
-		time_left--;
+		int run_status = run(proc);
+		if (run_status == DMA_MEMCPY_PENDING
+		    && scheduler_dma_block(proc, id)) {
+			proc = NULL;
+			time_left = 0;
+		} else {
+			time_left--;
+		}
 		next_slot(timer_id);
 	}
 	detach_event(timer_id);
@@ -126,19 +131,27 @@ static void * cpu_routine(void * args) {
 
 static void * co_processor(void *arg) {
     (void)arg;
-    /* TODO: Initialize the internal Verilator RTL simulation.
-	 *       This is necessary to ensure that the RTL simulation is ready for DPI calls.
-      */
-    if (rtl_dma_init_simulation() != 0) {
-        printf("Cannot initialize RTL simulation\n");
-        return (void*)1;
+    int engine_status = -1;
+    struct dma_req_t *req;
+
+    while ((req = dma_fetch()) != NULL) {
+        int status;
+        if (engine_status == -1) {
+            struct memphy_struct *mram = req->caller->krnl->mram;
+            if (mram != NULL && mram->storage != NULL
+                && dma_engine_init(mram->storage, mram->maxsz) == 0)
+                engine_status = 0;
+            else {
+                printf("[ERROR] Cannot initialize DMA engine\n");
+                engine_status = 1;
+            }
+        }
+        status = engine_status == 0
+               ? dma_engine_copy(req->src, req->dst, req->len) : -1;
+        libmem_dma_complete(req, status);
     }
-	
-	/* TODO: This asynchronous implementation of DMA
-     *        DMA completion callback is not yet implemented in this testbench
-     */
-    // Install callback handler
-    //dma_done_callback();  // Call the callback to signal DMA completion
+
+    rtl_dma_cleanup_simulation();
     return NULL;
 }
 
@@ -317,6 +330,7 @@ int main(int argc, char * argv[]) {
 
 	/* Init scheduler */
 	init_scheduler();
+	dma_queue_init();
 
 	/* Run CPU and loader */
 #ifdef MM_PAGING
@@ -337,6 +351,8 @@ int main(int argc, char * argv[]) {
 		pthread_join(cpu[i], NULL);
 	}
 	pthread_join(ld, NULL);
+	dma_queue_shutdown();
+	pthread_join(*dma, NULL);
 
 	/* Stop timer */
 	stop_timer();
@@ -344,6 +360,3 @@ int main(int argc, char * argv[]) {
 	return 0;
 
 }
-
-
-

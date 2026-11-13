@@ -144,6 +144,74 @@ struct pcb_t * find_proc_by_pid(uint32_t pid) {
 	return proc;
 }
 
+int scheduler_dma_begin(struct pcb_t *proc)
+{
+	int ret = -1;
+
+	pthread_mutex_lock(&queue_lock);
+	if (proc != NULL && !proc->dma_pending) {
+		proc->dma_pending = 1;
+		proc->dma_blocked = 0;
+		proc->dma_completed = 0;
+		ret = 0;
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return ret;
+}
+
+int scheduler_dma_block(struct pcb_t *proc, int cpu_id)
+{
+	int blocked = 0;
+
+	pthread_mutex_lock(&queue_lock);
+	if (proc != NULL && proc->dma_pending) {
+		if (proc->dma_completed) {
+			proc->dma_pending = 0;
+			proc->dma_completed = 0;
+		} else {
+			purgequeue(&running_list, proc);
+			proc->dma_blocked = 1;
+			printf("\tCPU %d: Process %2d blocked on DMA\n", cpu_id, proc->pid);
+			blocked = 1;
+		}
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return blocked;
+}
+
+int scheduler_dma_wake(struct pcb_t *proc)
+{
+	int woke = 0;
+
+	pthread_mutex_lock(&queue_lock);
+	if (proc != NULL && proc->dma_pending) {
+		if (proc->dma_blocked) {
+			proc->dma_pending = 0;
+			proc->dma_blocked = 0;
+			proc->dma_completed = 0;
+			clamp_prio(proc);
+			enqueue(&mlq_ready_queue[proc->prio], proc);
+			printf("\tProcess %2d woken by DMA IRQ\n", proc->pid);
+			woke = 1;
+		} else {
+			proc->dma_completed = 1;
+		}
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return woke;
+}
+
+void scheduler_dma_cancel(struct pcb_t *proc)
+{
+	pthread_mutex_lock(&queue_lock);
+	if (proc != NULL) {
+		proc->dma_pending = 0;
+		proc->dma_blocked = 0;
+		proc->dma_completed = 0;
+	}
+	pthread_mutex_unlock(&queue_lock);
+}
+
 void add_mlq_proc(struct pcb_t * proc) {
 	/* A newly loaded process goes to the ready queue of its
 	 * priority level; it joins running_list when dispatched.
@@ -233,5 +301,3 @@ void add_proc(struct pcb_t * proc) {
 	pthread_mutex_unlock(&queue_lock);	
 }
 #endif
-
-

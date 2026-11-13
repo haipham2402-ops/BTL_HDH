@@ -31,6 +31,9 @@ typedef int memory_bank_t;
 // Initialize a memory bank with given size in bytes
 memory_bank_t memory_bank_init(size_t size_bytes);
 
+/* Attach caller-owned RAM as bank 0 without taking ownership of its storage. */
+int memory_bank_attach(void *ram, size_t size_bytes);
+
 // Cleanup all memory banks
 void memory_bank_cleanup(void);
 
