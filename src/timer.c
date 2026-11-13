@@ -2,6 +2,7 @@
 #include "timer.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 static pthread_t _timer;
 
@@ -12,14 +13,14 @@ struct timer_id_container_t {
 
 static struct timer_id_container_t * dev_list = NULL;
 
-static uint64_t _time;
+static atomic_uint_fast64_t _time;
 
 static int timer_started = 0;
-static int timer_stop = 0;
+static atomic_int timer_stop;
 
 
 static void * timer_routine(void * args) {
-	while (!timer_stop) {
+	while (!atomic_load(&timer_stop)) {
 		printf("Time slot %3lu\n", current_time());
 		int fsh = 0;
 		int event = 0;
@@ -42,7 +43,7 @@ static void * timer_routine(void * args) {
 		}
 
 		/* Increase the time slot */
-		_time++;
+		atomic_fetch_add(&_time, 1);
 		
 		/* Let devices continue their job */
 		for (temp = dev_list; temp != NULL; temp = temp->next) {
@@ -77,7 +78,7 @@ void next_slot(struct timer_id_t * timer_id) {
 }
 
 uint64_t current_time() {
-	return _time;
+	return atomic_load(&_time);
 }
 
 void start_timer() {
@@ -118,7 +119,7 @@ struct timer_id_t * attach_event() {
 }
 
 void stop_timer() {
-	timer_stop = 1;
+	atomic_store(&timer_stop, 1);
 	pthread_join(_timer, NULL);
 	while (dev_list != NULL) {
 		struct timer_id_container_t * temp = dev_list;
@@ -130,7 +131,6 @@ void stop_timer() {
 		free(temp);
 	}
 }
-
 
 
 

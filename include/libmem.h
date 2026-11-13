@@ -29,4 +29,5 @@ int libkmem_malloc(struct pcb_t*, uint32_t, uint32_t);
 int libkmem_copy_from_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libkmem_copy_to_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libmem_dma_memcpy(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+int libmem_dma_prepare(struct dma_req_t*);
 void libmem_dma_complete(struct dma_req_t*, int);

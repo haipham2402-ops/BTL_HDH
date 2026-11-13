@@ -15,14 +15,17 @@
 
 struct pcb_t;
 struct dma_job_t;
+struct dma_pin_ref;
 
 /* One DMA transfer request, issued by a CPU, served by co_processor */
 struct dma_req_t {
 	struct pcb_t *caller;
 	struct dma_job_t *job;
-	uint64_t src;           /* source bus address      */
-	uint64_t dst;           /* destination bus address */
+	uint64_t src;           /* virtual until DMA worker translates it */
+	uint64_t dst;           /* virtual until DMA worker translates it */
 	uint64_t len;           /* bytes                   */
+	uint64_t offset;        /* offset in the source/destination regions */
+	struct dma_pin_ref *pins;
 	int done;               /* set to 1 by co_processor (IRQ) */
 	int status;             /* 0 = ok, <0 = error      */
 	pthread_cond_t done_cv; /* signalled on completion */

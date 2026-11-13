@@ -136,7 +136,13 @@ static void * co_processor(void *arg) {
 
     while ((req = dma_fetch()) != NULL) {
         int status;
-        if (engine_status == -1) {
+        status = libmem_dma_prepare(req);
+        if (status == 0) {
+            printf("DMA SUBMIT pid=%d src=0x%lx dst=0x%lx len=%lu\n",
+                   req->caller->pid, (unsigned long) req->src,
+                   (unsigned long) req->dst, (unsigned long) req->len);
+        }
+        if (status == 0 && engine_status == -1) {
             struct memphy_struct *mram = req->caller->krnl->mram;
             if (mram != NULL && mram->storage != NULL
                 && dma_engine_init(mram->storage, mram->maxsz) == 0)
@@ -146,7 +152,8 @@ static void * co_processor(void *arg) {
                 engine_status = 1;
             }
         }
-        status = engine_status == 0
+        if (status == 0)
+            status = engine_status == 0
                ? dma_engine_copy(req->src, req->dst, req->len) : -1;
         libmem_dma_complete(req, status);
     }
