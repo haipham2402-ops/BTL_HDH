@@ -33,6 +33,12 @@ struct pcb_t * find_proc_by_pid(uint32_t pid);
 /* Remove a finished process from the kernel lists before freeing it */
 void finish_proc(struct pcb_t * proc);
 
+/* DMA process state transitions; these functions serialize with dispatch. */
+int scheduler_dma_begin(struct pcb_t *proc);
+int scheduler_dma_block(struct pcb_t *proc, int cpu_id);
+int scheduler_dma_wake(struct pcb_t *proc);
+void scheduler_dma_cancel(struct pcb_t *proc);
+
 #ifdef __cplusplus
 }
 #endif

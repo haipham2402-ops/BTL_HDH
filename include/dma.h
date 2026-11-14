@@ -21,14 +21,12 @@ extern "C" {
 /* Forward declaration */
 struct pcb_t;
 
-/*
- * do_dma - perform DMA function
- * caller: process control block
- * source: source memory address
- * destination: destination memory address
- * length: number of bytes to copy
- */
-int do_dma(struct pcb_t *caller, uint64_t source, uint64_t destination, uint64_t length);
+/* Engine calls use byte offsets into the OS MEMRAM and block until completion. */
+int dma_engine_init(void *ram, uint64_t ram_size);
+int dma_engine_copy(uint64_t src_phys, uint64_t dst_phys, uint64_t len);
+
+/* Return value from libmem_dma_memcpy when the process was queued for DMA. */
+#define DMA_MEMCPY_PENDING 2
 
 #ifdef __cplusplus
 }

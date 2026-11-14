@@ -17,6 +17,7 @@
 #include "syscall.h"
 #include "libmem.h"
 #include "dma.h"
+#include "dma_queue.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -24,6 +25,7 @@
 
 static pthread_mutex_t mmvm_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t kmm_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dma_unpinned = PTHREAD_COND_INITIALIZER;
 
 static int get_free_rg_in_vma(struct vm_area_struct *cur_vma, addr_t size,
                               struct vm_rg_struct *newrg);
@@ -36,9 +38,23 @@ static int get_free_rg_in_vma(struct vm_area_struct *cur_vma, addr_t size,
 struct resident_node {
   struct mm_struct *mm;
   addr_t pgn;
+  unsigned int pins;
   struct resident_node *next;
 };
 static struct resident_node *res_head = NULL, *res_tail = NULL;
+
+struct dma_pin_ref {
+  struct mm_struct *mm;
+  addr_t pgn;
+  struct dma_pin_ref *next;
+};
+
+struct dma_job_t {
+  struct pcb_t *caller;
+  uint32_t src_rg, dst_rg, offset, size;
+  size_t remaining;
+  int status;
+};
 
 /* Remove pgn from a per-process page list (mm->fifo_pgn) */
 static void pgn_list_remove(struct pgn_t **plist, addr_t pgn)
@@ -67,6 +83,7 @@ void mm_page_resident(struct mm_struct *mm, addr_t pgn)
 
   node->mm = mm;
   node->pgn = pgn;
+  node->pins = 0;
   node->next = NULL;
   if (res_tail == NULL)
     res_head = node;
@@ -75,6 +92,42 @@ void mm_page_resident(struct mm_struct *mm, addr_t pgn)
   res_tail = node;
 
   enlist_pgn_node(&mm->fifo_pgn, pgn);
+}
+
+static int resident_pin(struct mm_struct *mm, addr_t pgn)
+{
+  struct resident_node *it;
+
+  for (it = res_head; it != NULL; it = it->next)
+    if (it->mm == mm && it->pgn == pgn) {
+      it->pins++;
+      return 0;
+    }
+  return -1;
+}
+
+static void resident_unpin(struct mm_struct *mm, addr_t pgn)
+{
+  struct resident_node *it;
+
+  for (it = res_head; it != NULL; it = it->next)
+    if (it->mm == mm && it->pgn == pgn) {
+      if (it->pins > 0)
+        it->pins--;
+      return;
+    }
+}
+
+static int resident_all_pinned(void)
+{
+  struct resident_node *it;
+
+  if (res_head == NULL)
+    return 0;
+  for (it = res_head; it != NULL; it = it->next)
+    if (it->pins == 0)
+      return 0;
+  return 1;
 }
 
 /* Unlink a node from the queue, prev is its predecessor (or NULL) */
@@ -142,10 +195,14 @@ static struct memphy_struct *swap_dev(struct krnl_t *krnl, int id)
  */
 static int evict_one(struct pcb_t *caller, addr_t *retfpn, int via_syscall)
 {
-  struct resident_node *victim = res_head;
+  struct resident_node *victim = res_head, *victim_prev = NULL;
   struct krnl_t *krnl = caller->krnl;
   addr_t vicpte, vicfpn, swpfpn, swppte = 0;
 
+  while (victim != NULL && victim->pins != 0) {
+    victim_prev = victim;
+    victim = victim->next;
+  }
   if (victim == NULL)
     return -1;  /* nothing resident to replace */
 
@@ -178,7 +235,7 @@ static int evict_one(struct pcb_t *caller, addr_t *retfpn, int via_syscall)
   victim->mm->stat.evicted++;
   caller->mm->stat.swap_out++;
   pgn_list_remove(&victim->mm->fifo_pgn, victim->pgn);
-  resident_unlink(NULL, victim);
+  resident_unlink(victim_prev, victim);
   free(victim);
 
   *retfpn = vicfpn;
@@ -426,47 +483,65 @@ printf("%s:%d\n",__func__,__LINE__);
  *@caller: caller
  *
  */
-int pg_getpage(struct mm_struct *mm, int pgn, int *fpn, struct pcb_t *caller)
+static int pg_getpage_internal(struct mm_struct *mm, int pgn, int *fpn,
+                               struct pcb_t *caller, int via_syscall)
 {
-  addr_t pte = pte_get_entry(mm, pgn, caller);
-
-  if (PAGING_PAGE_PRESENT(pte))
-  {
-    mm->stat.page_hit++;
-#ifdef MM_REPLACE_LRU
-    resident_touch(mm, pgn);
-#endif
-    *fpn = PAGING_FPN(pte);
-    return 0;
-  }
-
-  if (!(pte & PAGING_PTE_SWAPPED_MASK))
-    return -1;  /* never mapped: invalid page access */
-
-  /* Page fault: the page is in MEMSWP, make it actively living */
+  addr_t pte;
   struct krnl_t *krnl = caller->krnl;
-  int swptyp = PAGING_PTE_SWPTYP(pte);
-  addr_t swpoff = PAGING_SWP(pte);
-  struct memphy_struct *swp = swap_dev(krnl, swptyp);
-  addr_t tgtfpn;
+  int page_fault_counted = 0;
+  int swptyp;
+  addr_t swpoff, tgtfpn;
+  struct memphy_struct *swp;
   struct sc_regs regs;
 
-  mm->stat.page_fault++;
-  if (swp == NULL)
-    return -1;
+  for (;;) {
+    pte = pte_get_entry(mm, pgn, caller);
+    if (PAGING_PAGE_PRESENT(pte)) {
+      if (!page_fault_counted)
+        mm->stat.page_hit++;
+#ifdef MM_REPLACE_LRU
+      resident_touch(mm, pgn);
+#endif
+      *fpn = PAGING_FPN(pte);
+      return 0;
+    }
 
-  /* Target frame: a free RAM frame, otherwise the frame of a victim
-   * page that is swapped out first (global FIFO/LRU) */
-  if (MEMPHY_get_freefp(krnl->mram, &tgtfpn) != 0
-      && evict_one(caller, &tgtfpn, 1) != 0)
-    return -1;
+    if (!(pte & PAGING_PTE_SWAPPED_MASK))
+      return -1;  /* never mapped: invalid page access */
 
-  /* Copy the page MEMSWP -> MEMRAM: SYSCALL 17 sys_memmap */
-  regs.a1 = SYSMEM_SWPIN_OP;
-  regs.a2 = swpoff;
-  regs.a3 = tgtfpn;
-  regs.a4 = swptyp;
-  _syscall(krnl, caller->pid, 17, &regs);
+    if (!page_fault_counted) {
+      mm->stat.page_fault++;
+      page_fault_counted = 1;
+    }
+    swptyp = PAGING_PTE_SWPTYP(pte);
+    swpoff = PAGING_SWP(pte);
+    swp = swap_dev(krnl, swptyp);
+    if (swp == NULL)
+      return -1;
+
+    /* Target frame: a free RAM frame, otherwise the frame of a victim
+     * page that is swapped out first (global FIFO/LRU). If every user
+     * page is pinned by an active DMA transfer, wait for its IRQ to unpin.
+     * pthread_cond_wait releases mmvm_lock while sleeping. */
+    if (MEMPHY_get_freefp(krnl->mram, &tgtfpn) == 0
+        || evict_one(caller, &tgtfpn, via_syscall) == 0)
+      break;
+    if (!via_syscall || !resident_all_pinned())
+      return -1;
+    pthread_cond_wait(&dma_unpinned, &mmvm_lock);
+  }
+
+  if (via_syscall) {
+    /* Copy the page MEMSWP -> MEMRAM: SYSCALL 17 sys_memmap */
+    regs.a1 = SYSMEM_SWPIN_OP;
+    regs.a2 = swpoff;
+    regs.a3 = tgtfpn;
+    regs.a4 = swptyp;
+    _syscall(krnl, caller->pid, 17, &regs);
+  } else if (__swap_cp_page(swp, swpoff, krnl->mram, tgtfpn) != 0) {
+    MEMPHY_put_freefp(krnl->mram, tgtfpn);
+    return -1;
+  }
   MEMPHY_put_freefp(swp, swpoff);
 
   /* Update its online status of the target page */
@@ -476,6 +551,11 @@ int pg_getpage(struct mm_struct *mm, int pgn, int *fpn, struct pcb_t *caller)
 
   *fpn = tgtfpn;
   return 0;
+}
+
+int pg_getpage(struct mm_struct *mm, int pgn, int *fpn, struct pcb_t *caller)
+{
+  return pg_getpage_internal(mm, pgn, fpn, caller, 1);
 }
 
 /*pg_getval - read value at given offset
@@ -813,24 +893,6 @@ int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
  *@offset: memory offset
  *@size: copied data size
  */
-int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t offset, uint32_t size)
-{
-  /* TODO: provide DMA mempy */
-
-  //struct krnl_t *krnl = caller->krnl;
-
-  /*
-   *  TODO: provide asynchronous dma memcpy
-   *        handling the dma_done_callback
-   */
-  //do_dma(caller, (uint64_t) src, (uint64_t) dst, (uint64_t) size);
-  //krnl->...
-  //krnl->...
-
-  return 0;
-}
-
-
 /* Physical address of kernel virtual address @kaddr (never swapped) */
 static int kmem_phys(struct krnl_t *krnl, addr_t kaddr, addr_t *phys)
 {
@@ -840,6 +902,263 @@ static int kmem_phys(struct krnl_t *krnl, addr_t kaddr, addr_t *phys)
     return -1;
   *phys = PAGING_FPN(pte) * PAGING64_PAGESZ + PAGING64_ADDR_OFFST(kaddr);
   return 0;
+}
+
+static int dma_pin_user_page(struct dma_req_t *req, struct mm_struct *mm,
+                             addr_t pgn)
+{
+  struct dma_pin_ref *pin;
+
+  for (pin = req->pins; pin != NULL; pin = pin->next)
+    if (pin->mm == mm && pin->pgn == pgn)
+      return 0;
+
+  pin = malloc(sizeof(*pin));
+  if (pin == NULL)
+    return -1;
+  if (resident_pin(mm, pgn) != 0) {
+    free(pin);
+    return -1;
+  }
+  pin->mm = mm;
+  pin->pgn = pgn;
+  pin->next = req->pins;
+  req->pins = pin;
+  return 0;
+}
+
+static int dma_translate(struct dma_job_t *job, struct dma_req_t *req,
+                         struct vm_rg_struct *rg, addr_t region_offset,
+                         addr_t *phys)
+{
+  addr_t addr = rg->rg_start + region_offset;
+  addr_t pgn = PAGING64_ADDR_PGN(addr);
+  int fpn;
+
+  if (rg->mode_bit == RG_MODE_KERNEL)
+    return kmem_phys(job->caller->krnl, addr, phys);
+
+  if (pg_getpage_internal(job->caller->mm, pgn, &fpn, job->caller, 0) != 0
+      || dma_pin_user_page(req, job->caller->mm, pgn) != 0)
+    return -1;
+  *phys = (addr_t) fpn * PAGING64_PAGESZ + PAGING64_ADDR_OFFST(addr);
+  return 0;
+}
+
+static void dma_release_pins(struct dma_req_t *req)
+{
+  struct dma_pin_ref *pin, *next;
+  int released = 0;
+
+  pthread_mutex_lock(&mmvm_lock);
+  for (pin = req->pins; pin != NULL; pin = next) {
+    next = pin->next;
+    resident_unpin(pin->mm, pin->pgn);
+    free(pin);
+    released = 1;
+  }
+  req->pins = NULL;
+  if (released)
+    pthread_cond_broadcast(&dma_unpinned);
+  pthread_mutex_unlock(&mmvm_lock);
+}
+
+int libmem_dma_prepare(struct dma_req_t *req)
+{
+  struct dma_job_t *job;
+  struct vm_rg_struct *src_rg, *dst_rg;
+  uint64_t src_size, dst_size;
+  int ret = -1;
+
+  if (req == NULL || req->job == NULL || req->caller == NULL)
+    return -1;
+
+  job = req->job;
+  pthread_mutex_lock(&mmvm_lock);
+  pthread_mutex_lock(&kmm_lock);
+  src_rg = get_symrg_byid(req->caller->mm, job->src_rg);
+  dst_rg = get_symrg_byid(req->caller->mm, job->dst_rg);
+  if (src_rg == NULL || dst_rg == NULL
+      || src_rg->rg_start >= src_rg->rg_end
+      || dst_rg->rg_start >= dst_rg->rg_end
+      || (src_rg->mode_bit != RG_MODE_USER && src_rg->mode_bit != RG_MODE_KERNEL)
+      || (dst_rg->mode_bit != RG_MODE_USER && dst_rg->mode_bit != RG_MODE_KERNEL))
+    goto done;
+
+  src_size = src_rg->rg_end - src_rg->rg_start;
+  dst_size = dst_rg->rg_end - dst_rg->rg_start;
+  if (req->offset > src_size || req->len > src_size - req->offset
+      || req->offset > dst_size || req->len > dst_size - req->offset)
+    goto done;
+
+  if (dma_translate(job, req, src_rg, req->offset, &req->src) != 0
+      || dma_translate(job, req, dst_rg, req->offset, &req->dst) != 0)
+    goto done;
+  ret = 0;
+
+done:
+  pthread_mutex_unlock(&kmm_lock);
+  pthread_mutex_unlock(&mmvm_lock);
+  if (ret != 0)
+    printf("[ERROR] PID %d: DMA address translation failed for dma_memcpy "
+           "src_rg=%u -> dst_rg=%u offset=%u size=%u\n",
+           req->caller->pid, job->src_rg, job->dst_rg,
+           job->offset, job->size);
+  return ret;
+}
+
+int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst,
+                      uint32_t offset, uint32_t size)
+{
+  struct dma_job_t *job = NULL;
+  struct dma_req_t *req_head = NULL, *req_tail = NULL, *req;
+  struct vm_rg_struct *src_rg, *dst_rg;
+  uint64_t remaining, current;
+  const char *failure = "invalid";
+
+  if (caller == NULL || caller->krnl == NULL || caller->mm == NULL
+      || caller->krnl->mram == NULL || size == 0
+      || src >= PAGING_MAX_SYMTBL_SZ || dst >= PAGING_MAX_SYMTBL_SZ) {
+    if (caller != NULL)
+      printf("[ERROR] PID %d: dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u invalid\n",
+             caller->pid, src, dst, offset, size);
+    return -1;
+  }
+
+  job = calloc(1, sizeof(*job));
+  if (job == NULL) {
+    failure = "DMA request allocation failed";
+    goto cleanup_invalid;
+  }
+  job->caller = caller;
+  job->src_rg = src;
+  job->dst_rg = dst;
+  job->offset = offset;
+  job->size = size;
+
+  pthread_mutex_lock(&mmvm_lock);
+  pthread_mutex_lock(&kmm_lock);
+  src_rg = get_symrg_byid(caller->mm, src);
+  dst_rg = get_symrg_byid(caller->mm, dst);
+  if (src_rg == NULL || dst_rg == NULL
+      || src_rg->rg_start >= src_rg->rg_end
+      || dst_rg->rg_start >= dst_rg->rg_end
+      || (src_rg->mode_bit != RG_MODE_USER && src_rg->mode_bit != RG_MODE_KERNEL)
+      || (dst_rg->mode_bit != RG_MODE_USER && dst_rg->mode_bit != RG_MODE_KERNEL)
+      || (uint64_t) offset > src_rg->rg_end - src_rg->rg_start
+      || (uint64_t) offset > dst_rg->rg_end - dst_rg->rg_start
+      || (uint64_t) size > src_rg->rg_end - src_rg->rg_start - offset
+      || (uint64_t) size > dst_rg->rg_end - dst_rg->rg_start - offset)
+    goto unlock_invalid;
+
+  remaining = size;
+  current = offset;
+  while (remaining > 0) {
+    uint64_t src_addr = src_rg->rg_start + current;
+    uint64_t dst_addr = dst_rg->rg_start + current;
+    uint64_t chunk = remaining;
+    uint64_t src_page_left = PAGING64_PAGESZ - PAGING64_ADDR_OFFST(src_addr);
+    uint64_t dst_page_left = PAGING64_PAGESZ - PAGING64_ADDR_OFFST(dst_addr);
+
+    if (chunk > src_page_left)
+      chunk = src_page_left;
+    if (chunk > dst_page_left)
+      chunk = dst_page_left;
+    req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+      failure = "DMA request allocation failed";
+      goto unlock_invalid;
+    }
+    if (pthread_cond_init(&req->done_cv, NULL) != 0) {
+      free(req);
+      failure = "DMA request initialization failed";
+      goto unlock_invalid;
+    }
+    req->caller = caller;
+    req->job = job;
+    req->src = src_addr;
+    req->dst = dst_addr;
+    req->len = chunk;
+    req->offset = current;
+    if (req_tail == NULL)
+      req_head = req;
+    else
+      req_tail->next = req;
+    req_tail = req;
+    job->remaining++;
+
+    current += chunk;
+    remaining -= chunk;
+  }
+
+  pthread_mutex_unlock(&kmm_lock);
+  pthread_mutex_unlock(&mmvm_lock);
+
+  if (scheduler_dma_begin(caller) != 0) {
+    failure = "DMA scheduler rejected request";
+    goto submit_invalid;
+  }
+  if (dma_submit_batch(req_head, job->remaining) != 0) {
+    scheduler_dma_cancel(caller);
+    failure = "DMA queue rejected request";
+    goto submit_invalid;
+  }
+  return DMA_MEMCPY_PENDING;
+
+unlock_invalid:
+  pthread_mutex_unlock(&kmm_lock);
+  pthread_mutex_unlock(&mmvm_lock);
+  goto cleanup_invalid;
+
+submit_invalid:
+  scheduler_dma_cancel(caller);
+
+cleanup_invalid:
+  req = req_head;
+  while (req != NULL) {
+    struct dma_req_t *next = req->next;
+    pthread_cond_destroy(&req->done_cv);
+    free(req);
+    req = next;
+  }
+  if (job != NULL) {
+    free(job);
+  }
+  if (strcmp(failure, "invalid") == 0)
+    printf("[ERROR] PID %d: dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u invalid\n",
+           caller->pid, src, dst, offset, size);
+  else
+    printf("[ERROR] PID %d: %s for dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u\n",
+           caller->pid, failure, src, dst, offset, size);
+  return -1;
+}
+
+void libmem_dma_complete(struct dma_req_t *req, int status)
+{
+  struct dma_job_t *job;
+
+  if (req == NULL)
+    return;
+  job = req->job;
+  dma_release_pins(req);
+  printf("DMA IRQ pid=%d len=%lu status=%d\n", req->caller->pid,
+         (unsigned long) req->len, status);
+  if (status != 0)
+    job->status = status;
+
+  if (job->remaining > 0)
+    job->remaining--;
+  if (job->remaining == 0) {
+    scheduler_dma_wake(job->caller);
+    if (job->status == 0)
+      printf("dma_memcpy src_rg=%u -> dst_rg=%u offset=%u size=%u done\n",
+             job->src_rg, job->dst_rg, job->offset, job->size);
+    free(job);
+  }
+
+  dma_complete(req, status);
+  pthread_cond_destroy(&req->done_cv);
+  free(req);
 }
 
 /*__read_kernel_mem - read value in kernel region memory
@@ -953,19 +1272,23 @@ int libkmem_copy_from_user(struct pcb_t *caller, uint32_t source, uint32_t desti
   BYTE b;
 
   pthread_mutex_lock(&mmvm_lock);
-  pthread_mutex_lock(&kmm_lock);
   /* Validate the whole transfer first: all or nothing */
   if (kcopy_check(caller, source, destination, offset, size) != 0)
     ret = -1;
-  for (i = 0; ret == 0 && i < size; i++)
-    if (__read_user_mem(caller, 0, source, offset + i, &b) != 0
-        || __write_kernel_mem(caller, 0, destination, offset + i, b) != 0)
+  for (i = 0; ret == 0 && i < size; i++) {
+    if (__read_user_mem(caller, 0, source, offset + i, &b) != 0) {
       ret = -1;
+    } else {
+      pthread_mutex_lock(&kmm_lock);
+      if (__write_kernel_mem(caller, 0, destination, offset + i, b) != 0)
+        ret = -1;
+      pthread_mutex_unlock(&kmm_lock);
+    }
+  }
   if (ret == 0)
     caller->mm->stat.kcopy_bytes += size;
   else
     caller->mm->stat.invalid_access++;
-  pthread_mutex_unlock(&kmm_lock);
   pthread_mutex_unlock(&mmvm_lock);
 
   if (ret != 0)
@@ -989,18 +1312,22 @@ int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destina
   BYTE b;
 
   pthread_mutex_lock(&mmvm_lock);
-  pthread_mutex_lock(&kmm_lock);
   if (kcopy_check(caller, destination, source, offset, size) != 0)
     ret = -1;
-  for (i = 0; ret == 0 && i < size; i++)
-    if (__read_kernel_mem(caller, 0, source, offset + i, &b) != 0
-        || __write_user_mem(caller, 0, destination, offset + i, b) != 0)
+  for (i = 0; ret == 0 && i < size; i++) {
+    pthread_mutex_lock(&kmm_lock);
+    int read_status = __read_kernel_mem(caller, 0, source, offset + i, &b);
+    pthread_mutex_unlock(&kmm_lock);
+    if (read_status != 0) {
       ret = -1;
+    } else if (__write_user_mem(caller, 0, destination, offset + i, b) != 0) {
+      ret = -1;
+    }
+  }
   if (ret == 0)
     caller->mm->stat.kcopy_bytes += size;
   else
     caller->mm->stat.invalid_access++;
-  pthread_mutex_unlock(&kmm_lock);
   pthread_mutex_unlock(&mmvm_lock);
 
   if (ret != 0)
@@ -1064,13 +1391,12 @@ int mm_report_and_release(struct pcb_t *proc)
   {
     int ntbl[5];
     struct mm_stat_struct *st = &proc->mm->stat;
-    unsigned long acc = st->mem_read + st->mem_write;
+    unsigned long acc;
     addr_t pgtbl_sz;
 
     pthread_mutex_lock(&mmvm_lock);
+    acc = st->mem_read + st->mem_write;
     pgtbl_sz = mm64_pgtbl_stats(proc->mm, ntbl);
-    pthread_mutex_unlock(&mmvm_lock);
-
     printf("\tMMSTAT PID %d: alloc=%lu alloc_fail=%lu free=%lu read=%lu write=%lu "
            "page_hit=%lu page_fault=%lu swap_in=%lu swap_out=%lu evicted=%lu invalid=%lu\n",
            proc->pid, st->alloc_ok, st->alloc_fail, st->free_ok,
@@ -1081,6 +1407,7 @@ int mm_report_and_release(struct pcb_t *proc)
            (unsigned long) pgtbl_sz, ntbl[0], ntbl[1], ntbl[2], ntbl[3], ntbl[4]);
     printf("\tMMSTAT PID %d: kmalloc=%lu kfree=%lu kcopy_bytes=%lu priv_violation=%lu\n",
            proc->pid, st->kmalloc_ok, st->kfree_ok, st->kcopy_bytes, st->priv_violation);
+    pthread_mutex_unlock(&mmvm_lock);
   }
 #endif
 

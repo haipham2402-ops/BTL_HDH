@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdbool>
+#include <limits>
 #include <thread>
 #include <atomic>
 
@@ -148,6 +149,49 @@ extern "C" int do_dma(struct pcb_t *caller,uint64_t source, uint64_t destination
     //dma_done_callback();  // Call the callback to signal DMA completion
 
     return test_errors;
+}
+
+extern "C" int dma_engine_init(void *ram, uint64_t ram_size) {
+    if (ram == nullptr || ram_size == 0
+        || ram_size > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    if (rtl_dma_init_simulation() != 0) {
+        return -1;
+    }
+    if (memory_bank_attach(ram, static_cast<size_t>(ram_size)) != 0) {
+        rtl_dma_cleanup_simulation();
+        return -1;
+    }
+    return 0;
+}
+
+extern "C" int dma_engine_copy(uint64_t src_phys, uint64_t dst_phys, uint64_t len) {
+    const uint64_t ram_size = static_cast<uint64_t>(memory_bank_get_size());
+
+    if (!memory_bank_is_available() || len == 0
+        || src_phys > ram_size || len > ram_size - src_phys
+        || dst_phys > ram_size || len > ram_size - dst_phys) {
+        return -1;
+    }
+
+    /* The RTL bus transfers 32-bit words; copy only complete words through it. */
+    const uint64_t word_bytes = len & ~static_cast<uint64_t>(3);
+    if (word_bytes != 0
+        && dpi_rtl_dma_copy(src_phys, dst_phys, word_bytes) != 0) {
+        return -1;
+    }
+
+    if (word_bytes != len) {
+        uint8_t *ram = static_cast<uint8_t*>(memory_bank_get_ptr(0));
+        if (ram == nullptr) {
+            return -1;
+        }
+        std::memmove(ram + dst_phys + word_bytes,
+                     ram + src_phys + word_bytes,
+                     static_cast<size_t>(len - word_bytes));
+    }
+    return 0;
 }
 
 #if DMA_MAIN == 1

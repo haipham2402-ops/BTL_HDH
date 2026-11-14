@@ -24,6 +24,7 @@ typedef struct {
     uint8_t* data;
     size_t size;
     int initialized;
+    int owns_data;
 } memory_bank_t_struct;
 
 // Array of memory banks
@@ -61,22 +62,38 @@ memory_bank_t memory_bank_init(size_t size_bytes) {
     g_banks[free_slot].data = data;
     g_banks[free_slot].size = size_bytes;
     g_banks[free_slot].initialized = 1;
+    g_banks[free_slot].owns_data = 1;
     g_bank_count++;
 
     printf("Memory bank [%d] initialized: %zu bytes at address %p\n", free_slot, size_bytes, (void*)data);
     return free_slot;
 }
 
+int memory_bank_attach(void *ram, size_t size_bytes) {
+    if (ram == NULL || size_bytes == 0 || g_banks[0].initialized) {
+        printf("Invalid or already attached bank 0\n");
+        return -1;
+    }
+
+    g_banks[0].data = (uint8_t*)ram;
+    g_banks[0].size = size_bytes;
+    g_banks[0].initialized = 1;
+    g_banks[0].owns_data = 0;
+    g_bank_count++;
+    return 0;
+}
+
 // Cleanup memory bank
 void memory_bank_cleanup(void) {
     for (int i = 0; i < MAX_MEMORY_BANKS; i++) {
         if (g_banks[i].initialized) {
-            if (g_banks[i].data) {
+            if (g_banks[i].owns_data && g_banks[i].data) {
                 free(g_banks[i].data);
-                g_banks[i].data = NULL;
             }
+            g_banks[i].data = NULL;
             g_banks[i].size = 0;
             g_banks[i].initialized = 0;
+            g_banks[i].owns_data = 0;
             g_bank_count--;
             printf("Memory bank [%d] cleaned up\n", i);
         }
@@ -95,7 +112,7 @@ int memory_bank_is_available(void) {
 
 // Get pointer to locate data at offset
 void* memory_bank_get_ptr(uint64_t offset) {
-    if (offset >= g_banks[0].size) {
+    if (!g_banks[0].initialized || offset >= g_banks[0].size) {
         return NULL;
     }
 
@@ -116,26 +133,30 @@ extern "C" {
  * DPI Callback: Called from RTL when DMA read access
  */
 int dpi_bank_read32_legacy(long long offset) {
-    uint8_t data[4] = {0};
+    uint32_t data = 0;
 
+    if (offset < 0 || (uint64_t)offset > g_banks[0].size
+        || g_banks[0].size - (size_t)offset < sizeof(data))
+        return 0;
     void* src = memory_bank_get_ptr((size_t)offset);
 
-    //printf("MEM READ RESULT: Address=%p, DPI return=%x, Readback=%x, Match=%d\n",
-    //        (void*)((size_t)offset), *(unsigned int*)data, *(unsigned int*)data, 1);
-    //fflush(stdout);
-    
-    memcpy(&data, src, 4);
+    if (src == NULL)
+        return 0;
+    memcpy(&data, src, sizeof(data));
 
-    return  *((uint32_t*)data);
+    return (int)data;
 }
 
 /**
  * DPI Callback: Called from RTL when DMA write access
  */
 int dpi_bank_write32_legacy(long long offset, int value) {
+    if (offset < 0 || (uint64_t)offset > g_banks[0].size
+        || g_banks[0].size - (size_t)offset < sizeof(value))
+        return -1;
     void* dst = memory_bank_get_ptr((size_t)offset);
-    //printf("MEM WRITE RESULT: Address=%p, Write data=%x, Write rc=0, Readback=%x, Match=1\n",
-    //        (void*)((size_t)offset), *(unsigned int*)&value, *(unsigned int*)&value);
+    if (dst == NULL)
+        return -1;
     memcpy(dst,  &value, 4);
     //fflush(stdout);
        
@@ -155,4 +176,3 @@ void dma_done_callback(void)
 #ifdef __cplusplus
 }
 #endif
-
